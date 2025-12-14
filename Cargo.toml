@@ -1,0 +1,52 @@
+[package]
+name = "pep"
+version = "0.1.0"
+edition = "2021"
+description = "Policy Enforcement Point - OIDC authentication and authorization library"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/podtan/pep"
+keywords = ["oidc", "authentication", "authorization", "jwt", "security"]
+categories = ["authentication", "web-programming"]
+
+[dependencies]
+# Core async runtime and utilities
+anyhow = "1.0"
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time"] }
+tracing = "0.1"
+
+# HTTP client for OIDC operations
+reqwest = { version = "0.12", features = ["json", "rustls-tls-webpki-roots"], default-features = false }
+
+# JWT handling
+jsonwebtoken = "9.3"
+
+# URL encoding
+urlencoding = "2.1"
+
+# Base64 encoding
+base64 = "0.22"
+
+# UUID generation
+uuid = { version = "1.0", features = ["v4"] }
+
+# Random number generation
+rand = "0.8"
+
+# SHA256 for PKCE
+sha2 = "0.10"
+
+# HTTP types for status codes
+http = "1.0"
+
+[features]
+default = []
+oidc = ["oidc-client", "oidc-resource-server"]
+oidc-client = []
+oidc-resource-server = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
