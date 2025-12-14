@@ -8,6 +8,28 @@
 //! - `oidc-client`: OIDC client functionality for web applications
 //! - `oidc-resource-server`: JWT validation middleware for API protection
 //! - `oidc`: Enables both client and resource server features
+//! - `axum`: Axum web framework integration (extractors, bearer token helpers)
+//!
+//! ## Example (Resource Server with Axum)
+//!
+//! ```rust,ignore
+//! use pep::axum::{JwtClaimsExtractor, extract_bearer_token};
+//! use pep::oidc_resource_server::ResourceServerClient;
+//!
+//! async fn protected_handler(claims: JwtClaimsExtractor) -> String {
+//!     format!("Hello, {}!", claims.sub)
+//! }
+//! ```
+//!
+//! ## Example (Development Mode)
+//!
+//! ```rust
+//! use pep::DevConfig;
+//!
+//! let dev = DevConfig::enabled();
+//! let claims = dev.create_dev_claims();
+//! assert_eq!(claims.iss, "dev");
+//! ```
 
 pub mod error;
 pub use error::{PepError, Result};
@@ -15,6 +37,13 @@ pub use error::{PepError, Result};
 // Internal oidc module - always available when any oidc feature is enabled
 #[cfg(any(feature = "oidc", feature = "oidc-client", feature = "oidc-resource-server"))]
 pub mod oidc;
+
+// Axum integration module
+#[cfg(feature = "axum")]
+pub mod axum_integration;
+
+#[cfg(feature = "axum")]
+pub use axum_integration as axum;
 
 // Re-export modules at crate root for convenience
 #[cfg(feature = "oidc-client")]
@@ -32,6 +61,10 @@ pub use crate::oidc::types::OidcClientConfig;
 
 #[cfg(any(feature = "oidc", feature = "oidc-resource-server"))]
 pub use crate::oidc::types::{JwtValidationOptions, ResourceServerConfig, CachedJwks};
+
+// Re-export axum types at crate root when feature is enabled
+#[cfg(feature = "axum")]
+pub use axum_integration::{JwtClaimsExtractor, extract_bearer_token};
 
 #[cfg(test)]
 mod tests {

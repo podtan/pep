@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// JWT claims structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +27,27 @@ pub struct JwtClaims {
     /// Additional custom claims
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+impl Default for JwtClaims {
+    fn default() -> Self {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        Self {
+            sub: "anonymous".to_string(),
+            iss: "unknown".to_string(),
+            aud: None,
+            exp: now + 3600, // 1 hour from now
+            iat: Some(now),
+            email: None,
+            name: None,
+            preferred_username: None,
+            extra: HashMap::new(),
+        }
+    }
 }
 
 /// OIDC discovery document
@@ -96,7 +118,7 @@ pub struct ResourceServerConfig {
 }
 
 /// Local development configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DevConfig {
     /// Enable local development mode
     pub local_dev_mode: bool,
@@ -106,4 +128,58 @@ pub struct DevConfig {
     pub local_dev_name: Option<String>,
     /// Mock username for dev mode
     pub local_dev_username: Option<String>,
+}
+
+impl DevConfig {
+    /// Create a new DevConfig with dev mode enabled
+    pub fn enabled() -> Self {
+        Self {
+            local_dev_mode: true,
+            local_dev_email: Some("dev@localhost".to_string()),
+            local_dev_name: Some("Dev User".to_string()),
+            local_dev_username: Some("dev".to_string()),
+        }
+    }
+
+    /// Create mock JWT claims for development mode
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use pep::oidc::types::DevConfig;
+    ///
+    /// let dev_config = DevConfig {
+    ///     local_dev_mode: true,
+    ///     local_dev_email: Some("test@example.com".to_string()),
+    ///     local_dev_name: Some("Test User".to_string()),
+    ///     local_dev_username: Some("testuser".to_string()),
+    /// };
+    ///
+    /// let claims = dev_config.create_dev_claims();
+    /// assert_eq!(claims.email, Some("test@example.com".to_string()));
+    /// assert_eq!(claims.name, Some("Test User".to_string()));
+    /// ```
+    pub fn create_dev_claims(&self) -> JwtClaims {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        
+        JwtClaims {
+            sub: self.local_dev_username.clone().unwrap_or_else(|| "dev-user".to_string()),
+            iss: "dev".to_string(),
+            aud: Some("development".to_string()),
+            exp: now + 86400, // 24 hours
+            iat: Some(now),
+            email: self.local_dev_email.clone(),
+            name: self.local_dev_name.clone(),
+            preferred_username: self.local_dev_username.clone(),
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Check if dev mode is enabled
+    pub fn is_enabled(&self) -> bool {
+        self.local_dev_mode
+    }
 }

@@ -1,5 +1,9 @@
 # PEP - Policy Enforcement Point
 
+[![Crates.io](https://img.shields.io/crates/v/pep.svg)](https://crates.io/crates/pep)
+[![Documentation](https://docs.rs/pep/badge.svg)](https://docs.rs/pep)
+[![License](https://img.shields.io/crates/l/pep.svg)](LICENSE)
+
 A Rust library providing OIDC (OpenID Connect) authentication and authorization functionality for both client-side web applications and resource server API protection.
 
 ## Features
@@ -8,13 +12,20 @@ A Rust library providing OIDC (OpenID Connect) authentication and authorization 
   - Authorization code flow with PKCE
   - Token exchange
   - OIDC discovery document handling
-  - Development mode support
+  - State and nonce generation
 
 - **`oidc-resource-server`**: JWT validation for API protection
   - JWT token validation with JWKS
-  - Configurable validation options
+  - Configurable validation options (skip issuer/audience validation)
   - Automatic key rotation handling
   - Caching for performance
+
+- **`axum`** (optional): Axum web framework integration
+  - `JwtClaimsExtractor` for easy claims extraction in handlers
+  - `extract_bearer_token` utility for Authorization header parsing
+
+- **Development Mode**: Built-in support for local development
+  - `DevConfig.create_dev_claims()` for mock JWT claims
 
 ## Installation
 
@@ -22,22 +33,54 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
+# Full OIDC support (client + resource server)
 pep = { version = "0.1", features = ["oidc"] }
-```
 
-Or enable specific features:
+# Or enable specific features
+pep = { version = "0.1", features = ["oidc-resource-server"] }
 
-```toml
-[dependencies]
-pep = { version = "0.1", features = ["oidc-client", "oidc-resource-server"] }
+# With Axum integration (requires axum 0.8+)
+pep = { version = "0.1", features = ["oidc-resource-server", "axum"] }
 ```
 
 ## Usage
 
-### OIDC Client
+### Resource Server (JWT Validation)
 
 ```rust
-use pep::oidc_client::{OidcClient, OidcClientConfig};
+use pep::oidc_resource_server::ResourceServerClient;
+use pep::JwtValidationOptions;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ResourceServerClient::new();
+
+    let validation_options = JwtValidationOptions {
+        skip_issuer_validation: false,
+        skip_audience_validation: false,
+        expected_audience: None, // Uses client_id by default
+    };
+
+    // Validate JWT token
+    let claims = client.validate_jwt_with_options(
+        "jwt-token-here",
+        "https://your-oidc-provider.com",
+        "your-client-id",
+        &validation_options,
+    ).await?;
+
+    println!("User ID: {}", claims.sub);
+    println!("Email: {:?}", claims.email);
+
+    Ok(())
+}
+```
+
+### OIDC Client (Web Authentication Flow)
+
+```rust
+use pep::oidc_client::OidcClient;
+use pep::OidcClientConfig;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -61,9 +104,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth_url = client.build_authorization_url(&config, &state, Some(&code_challenge)).await?;
 
     // Redirect user to auth_url...
-
-    // After user returns with code, exchange for tokens
-    let token_response = client.exchange_code_for_tokens(&config, "auth-code", Some(&code_verifier)).await?;
+    // After user returns with code:
+    let token_response = client.exchange_code_for_tokens(
+        &config, 
+        "auth-code", 
+        Some(&code_verifier)
+    ).await?;
 
     println!("Access token: {}", token_response.access_token);
 
@@ -71,53 +117,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-### Resource Server
+### Axum Integration
+
+When using the `axum` feature with Axum 0.8+:
 
 ```rust
-use pep::oidc_resource_server::{ResourceServerClient, JwtValidationOptions};
+use axum::{routing::get, Router};
+use pep::axum::{JwtClaimsExtractor, extract_bearer_token};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = ResourceServerClient::new();
-
-    let validation_options = JwtValidationOptions {
-        skip_issuer_validation: false,
-        skip_audience_validation: false,
-        expected_audience: None,
-    };
-
-    // Validate JWT token
-    let claims = client.validate_jwt_with_options(
-        "jwt-token-here",
-        "https://your-oidc-provider.com",
-        "your-client-id",
-        &validation_options,
-    ).await?;
-
-    println!("User ID: {}", claims.sub);
-    println!("Email: {:?}", claims.email);
-
-    Ok(())
+async fn protected_handler(claims: JwtClaimsExtractor) -> String {
+    format!("Hello, {}!", claims.sub)
 }
+
+let app = Router::new()
+    .route("/protected", get(protected_handler));
 ```
 
-## Development Mode
+### Development Mode
 
-Both client and resource server support development mode for local testing:
+Create mock JWT claims for local development without a real OIDC provider:
 
 ```rust
-use pep::oidc_client::{DevAuthHelper, DevConfig};
+use pep::DevConfig;
 
+// Create dev config
 let dev_config = DevConfig {
     local_dev_mode: true,
-    local_dev_email: Some("dev@example.com".to_string()),
+    local_dev_email: Some("dev@localhost".to_string()),
     local_dev_name: Some("Dev User".to_string()),
     local_dev_username: Some("devuser".to_string()),
 };
 
-let session_data = DevAuthHelper::create_dev_session(&dev_config);
+// Generate mock claims
+let claims = dev_config.create_dev_claims();
+
+// Or use the convenience constructor
+let dev = DevConfig::enabled();
+let claims = dev.create_dev_claims();
+
+assert_eq!(claims.iss, "dev");
+assert_eq!(claims.email, Some("dev@localhost".to_string()));
+```
+
+## Feature Flags
+
+| Feature | Description |
+|---------|-------------|
+| `oidc` | Enables both `oidc-client` and `oidc-resource-server` |
+| `oidc-client` | OIDC client for web authentication flows |
+| `oidc-resource-server` | JWT validation for API protection |
+| `axum` | Axum 0.8+ integration (extractors, utilities) |
+
+## JWT Claims Structure
+
+The `JwtClaims` struct provides access to standard OIDC claims:
+
+```rust
+pub struct JwtClaims {
+    pub sub: String,                          // Subject (user ID)
+    pub iss: String,                          // Issuer
+    pub aud: Option<String>,                  // Audience
+    pub exp: i64,                             // Expiration time
+    pub iat: Option<i64>,                     // Issued at
+    pub email: Option<String>,                // Email address
+    pub name: Option<String>,                 // Full name
+    pub preferred_username: Option<String>,   // Username
+    pub extra: HashMap<String, Value>,        // Additional claims
+}
+```
+
+## Error Handling
+
+PEP uses a custom `PepError` type with HTTP status code support:
+
+```rust
+use pep::{PepError, Result};
+
+fn handle_error(error: PepError) {
+    let status = error.status_code(); // Returns http::StatusCode
+    eprintln!("Error ({}): {}", status, error);
+}
 ```
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of:
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
