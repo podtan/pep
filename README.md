@@ -199,6 +199,29 @@ fn handle_error(error: PepError) {
 }
 ```
 
+## Configuration
+
+PEP can be configured using OIDC and Development settings. Below is a sample TOML configuration:
+
+```toml
+# OIDC configuration for authentication and resource server protection
+[oidc]
+provider = "kanidm"
+issuer_url = "https://idm.tanbal.ir"
+client_id = "your-client-id"
+client_secret = "your-client-secret"
+redirect_url = "https://your-app.com/auth/callback"
+code_challenge_method = "S256"
+scope = "openid email profile offline_access"
+
+# Local development configuration
+[dev]
+local_dev_mode = false  # Set to true to bypass real OIDC and use mock claims
+local_dev_email = "developer@example.com"
+local_dev_name = "Local Developer"
+local_dev_username = "developer"
+```
+
 ## License
 
 Licensed under either of:

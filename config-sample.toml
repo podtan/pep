@@ -1,0 +1,21 @@
+# PEP Configuration Sample
+# This file shows the OIDC and Development configuration sections used by PEP.
+
+# OIDC configuration for authentication and resource server protection
+[oidc]
+provider = "kanidm"
+issuer_url = "https://idm.tanbal.ir"
+client_id = "tangent"
+client_secret = "your_client_secret_here"
+redirect_url = "https://tangent.tanbal.ir/auth/callback"
+code_challenge_method = "S256"
+scope = "openid email profile offline_access"
+swagger_ui_enabled = true
+
+# Local development configuration
+[dev]
+local_dev_mode = false  # Set to true to bypass real OIDC and use mock claims
+local_dev_email = "developer@example.com"
+local_dev_role = "user"
+local_dev_name = "Local Developer"
+local_dev_username = "developer"
