@@ -9,6 +9,8 @@
 //! - `oidc-resource-server`: JWT validation middleware for API protection
 //! - `oidc`: Enables both client and resource server features
 //! - `axum`: Axum web framework integration (extractors, bearer token helpers)
+//! - `authorization`: Authorization helpers and middleware for role and scope verification
+//! - `config`: Standardized configuration parsing from TOML files
 //!
 //! ## Example (Resource Server with Axum)
 //!
@@ -73,6 +75,14 @@ pub use crate::oidc::types::{JwtValidationOptions, ResourceServerConfig, CachedJ
 // Re-export axum types at crate root when feature is enabled
 #[cfg(feature = "axum")]
 pub use axum_integration::{JwtClaimsExtractor, extract_bearer_token};
+
+// Authorization helpers and middleware module
+#[cfg(feature = "authorization")]
+pub mod auth;
+
+// Re-export authorization types when feature is enabled
+#[cfg(feature = "authorization")]
+pub use auth::{AuthorizationError, RequireRole, RequireScope};
 
 #[cfg(test)]
 mod tests {
