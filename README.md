@@ -41,6 +41,9 @@ pep = { version = "0.1", features = ["oidc-resource-server"] }
 
 # With Axum integration (requires axum 0.8+)
 pep = { version = "0.1", features = ["oidc-resource-server", "axum"] }
+
+# With configuration file parsing support
+pep = { version = "0.1", features = ["oidc", "config"] }
 ```
 
 ## Usage
@@ -167,6 +170,7 @@ assert_eq!(claims.email, Some("dev@localhost".to_string()));
 | `oidc-client` | OIDC client for web authentication flows |
 | `oidc-resource-server` | JWT validation for API protection |
 | `axum` | Axum 0.8+ integration (extractors, utilities) |
+| `config` | TOML configuration file parsing support |
 
 ## JWT Claims Structure
 
@@ -201,13 +205,17 @@ fn handle_error(error: PepError) {
 
 ## Configuration
 
-PEP can be configured using OIDC and Development settings. Below is a sample TOML configuration:
+PEP can be configured using OIDC and Development settings. The `config` feature provides utilities for loading configuration from TOML files.
+
+### Configuration File Format
+
+Create a `config.toml` file:
 
 ```toml
 # OIDC configuration for authentication and resource server protection
 [oidc]
 provider = "kanidm"
-issuer_url = "https://idm.tanbal.ir"
+issuer_url = "https://idm.example.com"
 client_id = "your-client-id"
 client_secret = "your-client-secret"
 redirect_url = "https://your-app.com/auth/callback"
@@ -221,6 +229,35 @@ local_dev_email = "developer@example.com"
 local_dev_name = "Local Developer"
 local_dev_username = "developer"
 ```
+
+### Loading Configuration (requires `config` feature)
+
+```rust
+use pep::config::load_config;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load configuration from file
+    let config = load_config("config.toml")?;
+    
+    // Get OIDC configuration
+    let oidc_config = config.oidc_config()?;
+    
+    // Convert to internal types for use with OIDC client
+    let client_config = oidc_config.to_oidc_client_config();
+    let resource_config = oidc_config.to_resource_server_config();
+    
+    // Use with OIDC client
+    let client = pep::oidc_client::OidcClient::new();
+    
+    // Use with resource server
+    let resource_client = pep::oidc_resource_server::ResourceServerClient::new();
+    
+    Ok(())
+}
+```
+
+A sample configuration file is available at [config-sample.toml](config-sample.toml).
 
 ## License
 

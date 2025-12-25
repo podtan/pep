@@ -45,6 +45,14 @@ pub mod axum_integration;
 #[cfg(feature = "axum")]
 pub use axum_integration as axum;
 
+// Configuration parsing module
+#[cfg(feature = "config")]
+pub mod config;
+
+// Re-export config types when feature is enabled
+#[cfg(feature = "config")]
+pub use config::{PepConfig, OidcConfig, OidcDevConfig, load_config};
+
 // Re-export modules at crate root for convenience
 #[cfg(feature = "oidc-client")]
 pub mod oidc_client;
