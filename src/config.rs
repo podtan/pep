@@ -13,7 +13,9 @@
 //! let client_config = oidc_config.to_oidc_client_config();
 //! ```
 
-use crate::{OidcClientConfig, DevConfig, Result, PepError};
+use crate::{DevConfig, Result, PepError};
+#[cfg(any(feature = "oidc", feature = "oidc-client"))]
+use crate::OidcClientConfig;
 use crate::oidc::types::{ResourceServerConfig, JwtValidationOptions};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -93,6 +95,7 @@ pub struct OidcConfig {
 
 impl OidcConfig {
     /// Convert to OidcClientConfig for use with OidcClient
+    #[cfg(any(feature = "oidc", feature = "oidc-client"))]
     pub fn to_oidc_client_config(&self) -> OidcClientConfig {
         OidcClientConfig {
             issuer_url: self.issuer_url.clone(),
