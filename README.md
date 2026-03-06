@@ -44,6 +44,12 @@ pep = { version = "0.1", features = ["oidc-resource-server", "axum"] }
 
 # With configuration file parsing support
 pep = { version = "0.1", features = ["oidc", "config"] }
+
+# With RFC 9728 Protected Resource Metadata
+pep = { version = "0.1", features = ["rfc9728"] }
+
+# Full-featured
+pep = { version = "0.1", features = ["oidc", "axum", "config", "rfc9728"] }
 ```
 
 ## Usage
@@ -171,6 +177,72 @@ assert_eq!(claims.email, Some("dev@localhost".to_string()));
 | `oidc-resource-server` | JWT validation for API protection |
 | `axum` | Axum 0.8+ integration (extractors, utilities) |
 | `config` | TOML configuration file parsing support |
+| `rfc9728` | RFC 9728 Protected Resource Metadata support |
+
+## RFC 9728: Protected Resource Metadata
+
+PEP supports [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) for publishing OAuth 2.0 Protected Resource Metadata. This allows resource servers to advertise their authentication requirements at a well-known endpoint.
+
+### Basic Usage
+
+```rust
+use pep::{PrmConfig, prm_route};
+use axum::Router;
+
+let prm_config = PrmConfig {
+    resource: "https://api.example.com".to_string(),
+    authorization_servers: vec!["https://idm.example.com".to_string()],
+    scopes_supported: vec!["openid".to_string(), "profile".to_string()],
+    bearer_methods_supported: vec!["header".to_string()],
+    ..Default::default()
+};
+
+let app = Router::new()
+    .route("/.well-known/oauth-protected-resource", prm_route())
+    .with_state(prm_config);
+```
+
+### Configuration
+
+Add to your `config.toml`:
+
+```toml
+[prm]
+resource = "https://aether.tanbal.com"
+authorization_servers = ["https://idm.tanbal.com"]
+jwks_uri = "https://idm.tanbal.com/oauth2/openid/aether-api/public_key.jwk"
+scopes_supported = ["openid", "profile", "email"]
+bearer_methods_supported = ["header"]
+resource_name = "Aether MCP Server"
+resource_documentation = "https://aether.tanbal.com/docs"
+```
+
+### Example Response
+
+When clients request `GET /.well-known/oauth-protected-resource`, they receive:
+
+```json
+{
+  "resource": "https://aether.tanbal.com",
+  "authorization_servers": ["https://idm.tanbal.com"],
+  "jwks_uri": "https://idm.tanbal.com/oauth2/openid/aether-api/public_key.jwk",
+  "scopes_supported": ["openid", "profile", "email"],
+  "bearer_methods_supported": ["header"],
+  "resource_name": "Aether MCP Server",
+  "resource_documentation": "https://aether.tanbal.com/docs"
+}
+```
+
+### MCP Client Auto-Discovery
+
+MCP clients (like VS Code) can use PRM to automatically discover authentication requirements:
+
+1. Client connects to `https://aether.tanbal.com/sse`
+2. Client fetches `https://aether.tanbal.com/.well-known/oauth-protected-resource`
+3. PRM tells client to use `https://idm.tanbal.com` as the authorization server
+4. Client initiates OAuth flow with discovered configuration
+
+This enables zero-configuration authentication for MCP clients.
 
 ## JWT Claims Structure
 

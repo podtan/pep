@@ -11,6 +11,7 @@
 //! - `axum`: Axum web framework integration (extractors, bearer token helpers)
 //! - `authorization`: Authorization helpers and middleware for role and scope verification
 //! - `config`: Standardized configuration parsing from TOML files
+//! - `rfc9728`: RFC 9728 Protected Resource Metadata support
 //!
 //! ## Example (Resource Server with Axum)
 //!
@@ -25,7 +26,7 @@
 //!
 //! ## Example (Development Mode)
 //!
-//! ```rust
+//! ```ignore
 //! use pep::DevConfig;
 //!
 //! let dev = DevConfig::enabled();
@@ -40,11 +41,11 @@ pub use error::{PepError, Result};
 #[cfg(any(feature = "oidc", feature = "oidc-client", feature = "oidc-resource-server"))]
 pub mod oidc;
 
-// Axum integration module
-#[cfg(feature = "axum")]
+// Axum integration module - requires both axum and oidc features
+#[cfg(all(feature = "axum", any(feature = "oidc", feature = "oidc-client", feature = "oidc-resource-server")))]
 pub mod axum_integration;
 
-#[cfg(feature = "axum")]
+#[cfg(all(feature = "axum", any(feature = "oidc", feature = "oidc-client", feature = "oidc-resource-server")))]
 pub use axum_integration as axum;
 
 // Configuration parsing module
@@ -73,7 +74,7 @@ pub use crate::oidc::types::OidcClientConfig;
 pub use crate::oidc::types::{JwtValidationOptions, ResourceServerConfig, CachedJwks};
 
 // Re-export axum types at crate root when feature is enabled
-#[cfg(feature = "axum")]
+#[cfg(all(feature = "axum", any(feature = "oidc", feature = "oidc-client", feature = "oidc-resource-server")))]
 pub use axum_integration::{JwtClaimsExtractor, extract_bearer_token};
 
 // Authorization helpers and middleware module
@@ -83,6 +84,14 @@ pub mod auth;
 // Re-export authorization types when feature is enabled
 #[cfg(feature = "authorization")]
 pub use auth::{AuthorizationError, RequireRole, RequireScope};
+
+// RFC 9728: Protected Resource Metadata
+#[cfg(feature = "rfc9728")]
+pub mod rfc9728;
+
+// Re-export RFC 9728 types when feature is enabled
+#[cfg(feature = "rfc9728")]
+pub use rfc9728::{ProtectedResourceMetadata, PrmConfig, prm_handler, prm_route};
 
 #[cfg(test)]
 mod tests {

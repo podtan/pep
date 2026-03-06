@@ -58,6 +58,7 @@ oidc-resource-server = []
 axum = ["dep:axum"]
 config = ["dep:toml"]
 authorization = ["oidc-resource-server", "axum", "dep:tower"]
+rfc9728 = ["axum"]
 
 [package.metadata.docs.rs]
 all-features = true
