@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// JWT claims structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,7 +35,7 @@ impl Default for JwtClaims {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        
+
         Self {
             sub: "anonymous".to_string(),
             iss: "unknown".to_string(),
@@ -73,9 +73,17 @@ pub struct CachedJwks {
     /// Decoded keys mapped by key ID
     pub keys: HashMap<String, (jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)>,
     /// When the keys were fetched
-    pub fetched_at: std::time::SystemTime,
+    pub fetched_at: SystemTime,
     /// How long to cache the keys
-    pub cache_duration: std::time::Duration,
+    pub cache_duration: Duration,
+}
+
+/// Cache entry for raw discovery JSON
+#[derive(Clone)]
+pub struct CachedDiscoveryRaw {
+    pub raw_json: String,
+    pub fetched_at: SystemTime,
+    pub cache_duration: Duration,
 }
 
 /// JWT validation options
@@ -164,9 +172,12 @@ impl DevConfig {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        
+
         JwtClaims {
-            sub: self.local_dev_username.clone().unwrap_or_else(|| "dev-user".to_string()),
+            sub: self
+                .local_dev_username
+                .clone()
+                .unwrap_or_else(|| "dev-user".to_string()),
             iss: "dev".to_string(),
             aud: Some("development".to_string()),
             exp: now + 86400, // 24 hours

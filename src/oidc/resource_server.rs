@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use tracing;
 
 use crate::error::{PepError, Result};
-use super::types::{JwtClaims, OidcDiscoveryDocument, CachedJwks, JwtValidationOptions};
+use super::types::{JwtClaims, OidcDiscoveryDocument, CachedJwks, CachedDiscoveryRaw, JwtValidationOptions};
 
 /// Map a JWK's algorithm parameters to a `jsonwebtoken::Algorithm`
 pub fn jwk_algorithm_to_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Result<Algorithm> {
@@ -31,8 +31,10 @@ pub struct ResourceServerClient {
     pub http_client: Client,
     /// JWKS cache
     pub jwks_cache: Arc<RwLock<HashMap<String, CachedJwks>>>,
-    /// Discovery document cache
+    /// Discovery document cache (parsed)
     pub discovery_cache: Arc<RwLock<HashMap<String, (OidcDiscoveryDocument, SystemTime)>>>,
+    /// Discovery document cache (raw JSON for proxying)
+    pub discovery_cache_raw: Arc<RwLock<HashMap<String, CachedDiscoveryRaw>>>,
 }
 
 impl ResourceServerClient {
@@ -42,6 +44,7 @@ impl ResourceServerClient {
             http_client: Client::new(),
             jwks_cache: Arc::new(RwLock::new(HashMap::new())),
             discovery_cache: Arc::new(RwLock::new(HashMap::new())),
+            discovery_cache_raw: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -85,6 +88,51 @@ impl ResourceServerClient {
         }
 
         Ok(discovery_doc)
+    }
+
+    /// Fetch OIDC discovery document as raw JSON with caching
+    pub async fn get_discovery_document_raw(&self, issuer_url: &str) -> Result<String> {
+        let cache_duration = Duration::from_secs(3600);
+        
+        {
+            let cache = self.discovery_cache_raw.read().await;
+            if let Some(cached) = cache.get(issuer_url) {
+                if cached.fetched_at.elapsed().unwrap_or(cache_duration) < cache_duration {
+                    return Ok(cached.raw_json.clone());
+                }
+            }
+        }
+
+        let discovery_url = format!("{}/.well-known/openid-configuration", issuer_url.trim_end_matches('/'));
+        tracing::debug!("Fetching raw OIDC discovery document from: {}", discovery_url);
+
+        let response = self.http_client
+            .get(&discovery_url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| PepError::OidcDiscovery(format!("Failed to fetch discovery document: {}", e)))?;
+
+        if !response.status().is_success() {
+            return Err(PepError::OidcDiscovery(format!("Discovery document fetch failed with status: {}", response.status())));
+        }
+
+        let raw_json = response
+            .text()
+            .await
+            .map_err(|e| PepError::OidcDiscovery(format!("Failed to read discovery document: {}", e)))?;
+
+        let cached = CachedDiscoveryRaw {
+            raw_json: raw_json.clone(),
+            fetched_at: SystemTime::now(),
+            cache_duration,
+        };
+        {
+            let mut cache = self.discovery_cache_raw.write().await;
+            cache.insert(issuer_url.to_string(), cached);
+        }
+
+        Ok(raw_json)
     }
 
     /// Fetch JWKS with caching

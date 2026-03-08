@@ -71,7 +71,7 @@ pub use crate::oidc::types::{JwtClaims, OidcDiscoveryDocument, DevConfig};
 pub use crate::oidc::types::OidcClientConfig;
 
 #[cfg(any(feature = "oidc", feature = "oidc-resource-server"))]
-pub use crate::oidc::types::{JwtValidationOptions, ResourceServerConfig, CachedJwks};
+pub use crate::oidc::types::{JwtValidationOptions, ResourceServerConfig, CachedJwks, CachedDiscoveryRaw};
 
 // Re-export axum types at crate root when feature is enabled
 #[cfg(all(feature = "axum", any(feature = "oidc", feature = "oidc-client", feature = "oidc-resource-server")))]
