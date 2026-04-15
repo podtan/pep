@@ -47,6 +47,9 @@ axum = { version = "0.8", optional = true }
 # Optional tower for middleware
 tower = { version = "0.5", optional = true }
 
+# Optional Cedar policy engine for ABAC authorization
+cedar-policy = { version = "4", optional = true }
+
 # Optional configuration parsing
 toml = { version = "0.8", optional = true }
 
@@ -59,6 +62,7 @@ axum = ["dep:axum"]
 config = ["dep:toml"]
 authorization = ["oidc-resource-server", "axum", "dep:tower"]
 rfc9728 = ["axum"]
+cedar = ["dep:cedar-policy", "oidc-resource-server"]
 
 [package.metadata.docs.rs]
 all-features = true

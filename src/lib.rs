@@ -12,6 +12,7 @@
 //! - `authorization`: Authorization helpers and middleware for role and scope verification
 //! - `config`: Standardized configuration parsing from TOML files
 //! - `rfc9728`: RFC 9728 Protected Resource Metadata support
+//! - `cedar`: AWS Cedar ABAC policy engine for fine-grained authorization
 //!
 //! ## Example (Resource Server with Axum)
 //!
@@ -53,8 +54,10 @@ pub use axum_integration as axum;
 pub mod config;
 
 // Re-export config types when feature is enabled
+#[cfg(all(feature = "config", feature = "cedar"))]
+pub use config::PepConfig; // re-exports CedarConfig via PepConfig::cedar
 #[cfg(feature = "config")]
-pub use config::{PepConfig, OidcConfig, OidcDevConfig, load_config};
+pub use config::{OidcConfig, OidcDevConfig, load_config};
 
 // Re-export modules at crate root for convenience
 #[cfg(feature = "oidc-client")]
@@ -92,6 +95,14 @@ pub mod rfc9728;
 // Re-export RFC 9728 types when feature is enabled
 #[cfg(feature = "rfc9728")]
 pub use rfc9728::{ProtectedResourceMetadata, PrmConfig, prm_handler, prm_route};
+
+// Cedar ABAC authorization module
+#[cfg(feature = "cedar")]
+pub mod cedar;
+
+// Re-export cedar types when feature is enabled
+#[cfg(feature = "cedar")]
+pub use cedar::{CedarAuthorizer, CedarConfig, CedarError};
 
 #[cfg(test)]
 mod tests {

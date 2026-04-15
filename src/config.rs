@@ -17,6 +17,8 @@ use crate::{DevConfig, Result, PepError};
 #[cfg(any(feature = "oidc", feature = "oidc-client"))]
 use crate::OidcClientConfig;
 use crate::oidc::types::{ResourceServerConfig, JwtValidationOptions};
+#[cfg(feature = "cedar")]
+use crate::cedar::config::CedarConfig;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -30,6 +32,11 @@ pub struct PepConfig {
     /// Development mode configuration section
     #[serde(default)]
     pub dev: Option<OidcDevConfig>,
+
+    /// Cedar ABAC authorization configuration section
+    #[cfg(feature = "cedar")]
+    #[serde(default)]
+    pub cedar: Option<CedarConfig>,
 }
 
 impl PepConfig {
@@ -48,6 +55,14 @@ impl PepConfig {
     /// Get development mode configuration
     pub fn dev_config(&self) -> Option<OidcDevConfig> {
         self.dev.clone()
+    }
+
+    /// Get Cedar authorization configuration
+    #[cfg(feature = "cedar")]
+    pub fn cedar_config(&self) -> Result<CedarConfig> {
+        self.cedar.clone().ok_or_else(|| {
+            PepError::Config("Cedar configuration not found in config file".to_string())
+        })
     }
 }
 

@@ -1,0 +1,93 @@
+// Cedar Schema for Tanbal Platform
+// Defines entity types and actions for the AAAA authorization model
+
+namespace Tanbal {
+    // ============ Entity Types ============
+
+    /// A user authenticated via OIDC
+    entity User = {
+        email: String,
+        role: String,
+        groups: Set<String>,
+    };
+
+    /// An AI or Human employee in the system
+    entity Employee = {
+        employee_type: String, // "Human" or "Ai"
+        role: String,
+    };
+
+    /// A project with workstreams
+    entity Project = {
+        status: String,
+        priority: String,
+    };
+
+    /// A task within a project/workstream
+    entity Task = {
+        status: String,
+        priority: String,
+        assignee: String,
+        scope: String,
+    };
+
+    /// A workstream within a project
+    entity Workstream = {
+        status: String,
+        priority: String,
+    };
+
+    /// A knowledge asset in PDT
+    entity Asset = {
+        type: String,
+        status: String,
+    };
+
+    // ============ Entity Hierarchy ============
+
+    // Projects contain Workstreams
+    entity Workstream in [Project] = {
+        status: String,
+        priority: String,
+    };
+
+    // Workstreams contain Tasks
+    entity Task in [Workstream, Project] = {
+        status: String,
+        priority: String,
+        assignee: String,
+        scope: String,
+    };
+
+    // Users can belong to Groups
+    entity Group = {
+        name: String,
+    };
+
+    // ============ Actions ============
+
+    action View appliesTo {
+        principal: [User, Employee],
+        resource: [Project, Task, Workstream, Asset],
+    };
+
+    action Create appliesTo {
+        principal: [User, Employee],
+        resource: [Project, Task, Workstream, Asset],
+    };
+
+    action Edit appliesTo {
+        principal: [User, Employee],
+        resource: [Project, Task, Workstream, Asset],
+    };
+
+    action Delete appliesTo {
+        principal: [User, Employee],
+        resource: [Project, Task, Workstream, Asset],
+    };
+
+    action FilterStatus appliesTo {
+        principal: [User, Employee],
+        resource: [Task, Workstream, Project],
+    };
+}
