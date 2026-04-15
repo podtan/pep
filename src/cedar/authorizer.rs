@@ -24,12 +24,13 @@
 //! assert!(response.allowed());
 //! ```
 
-use cedar_policy::{Authorizer, Decision, Entities, PolicySet, Request, Response};
+use cedar_policy::{Authorizer, Decision, Entities, PolicySet, Request, Response, Schema, Validator, ValidationMode};
 use std::path::Path;
 use std::sync::Arc;
 
 use super::config::CedarConfig;
 use super::error::{CedarError, CedarResult};
+use super::schema;
 
 /// Authorization response wrapping Cedar's native response
 #[derive(Debug, Clone)]
@@ -104,9 +105,11 @@ impl CedarAuthorizer {
     /// Create a new CedarAuthorizer with the given configuration
     ///
     /// Loads policies from the configured policy source and initializes
-    /// the Cedar authorizer engine.
+    /// the Cedar authorizer engine. If `schema_path` is set and
+    /// `validate_on_load` is true, policies are validated against the schema.
     pub fn new(config: CedarConfig) -> CedarResult<Self> {
-        let policies = Self::load_policies(&config)?;
+        let schema = Self::load_schema(&config)?;
+        let policies = Self::load_policies(&config, schema.as_ref())?;
         let entities = Entities::empty();
 
         Ok(Self {
@@ -118,7 +121,8 @@ impl CedarAuthorizer {
 
     /// Create a new CedarAuthorizer with pre-loaded entities
     pub fn with_entities(config: CedarConfig, entities: Entities) -> CedarResult<Self> {
-        let policies = Self::load_policies(&config)?;
+        let schema = Self::load_schema(&config)?;
+        let policies = Self::load_policies(&config, schema.as_ref())?;
 
         Ok(Self {
             authorizer: Authorizer::new(),
@@ -165,7 +169,8 @@ impl CedarAuthorizer {
 
     /// Reload policies from the configured source
     pub fn reload_policies(&mut self, config: &CedarConfig) -> CedarResult<()> {
-        let policies = Self::load_policies(config)?;
+        let schema = Self::load_schema(config)?;
+        let policies = Self::load_policies(config, schema.as_ref())?;
         self.policies = Arc::new(policies);
         Ok(())
     }
@@ -180,8 +185,18 @@ impl CedarAuthorizer {
         &self.entities
     }
 
-    /// Load policies from the configuration
-    fn load_policies(config: &CedarConfig) -> CedarResult<PolicySet> {
+    /// Load schema from config if schema_path is set
+    fn load_schema(config: &CedarConfig) -> CedarResult<Option<Schema>> {
+        if let Some(ref schema_path) = config.schema_path {
+            let schema = schema::load_schema(schema_path)?;
+            Ok(Some(schema))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Load policies from the configuration, optionally validating against a schema
+    fn load_policies(config: &CedarConfig, schema: Option<&Schema>) -> CedarResult<PolicySet> {
         let mut policy_set = PolicySet::new();
         let policy_path = &config.policy_path;
         let path = Path::new(policy_path);
@@ -208,6 +223,22 @@ impl CedarAuthorizer {
                 "Policy path does not exist: {:?}",
                 path
             )));
+        }
+
+        // Validate policies against schema if both are available
+        if let (Some(schema), true) = (schema, config.validate_on_load) {
+            let validator = Validator::new(schema.clone());
+            let validation = validator.validate(&policy_set, ValidationMode::default());
+            if !validation.validation_passed() {
+                let errors: Vec<String> = validation
+                    .validation_errors()
+                    .map(|e| e.to_string())
+                    .collect();
+                return Err(CedarError::Validation(format!(
+                    "Policy validation failed:\n{}",
+                    errors.join("\n")
+                )));
+            }
         }
 
         Ok(policy_set)

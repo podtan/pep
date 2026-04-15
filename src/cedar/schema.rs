@@ -1,170 +1,181 @@
-//! Default Cedar schema definitions for the Tanbal stack
+//! Cedar schema loading utilities
 //!
-//! This module provides the standard Cedar schema used across all Tanbal services.
-//! It defines entity types (User, Employee, Project, Task, Workstream, Asset)
-//! and actions (View, Create, Edit, Delete, Manage).
+//! This module provides functions to load Cedar schemas from `.cedarschema` files.
+//! Each service defines its own schema — PEP does **not** hardcode any entity types.
+//!
+//! # Example
+//!
+//! ```rust,ignore
+//! use pep::cedar::schema::load_schema;
+//!
+//! let schema = load_schema("policies/schema.cedarschema")?;
+//!
+//! // Or parse from a string
+//! let schema = parse_schema(&schema_str)?;
+//! ```
 
-/// Default Cedar schema in Cedar's native format, defining all Tanbal entity types and actions.
+use cedar_policy::Schema;
+use std::path::Path;
+
+use super::error::{CedarError, CedarResult};
+
+/// Load a Cedar schema from a `.cedarschema` file on disk.
 ///
-/// Entity hierarchy:
-/// - `User` — a human or AI principal identified by JWT subject
-/// - `Employee` — an employee record (Human or Ai)
-/// - `Project` — a top-level project container
-/// - `Workstream` — a sub-grouping within a project
-/// - `Task` — a unit of work within a workstream
-/// - `Asset` — a generic knowledge/document asset
-///
-/// Actions:
-/// - `View` — read-only access
-/// - `Create` — create new resources
-/// - `Edit` — modify existing resources
-/// - `Delete` — remove resources
-/// - `Manage` — administrative operations (assign, archive, status changes)
-pub const DEFAULT_CEDAR_SCHEMA: &str = r#"
-namespace Tanbal {
-    entity User = {
-        email?: String,
-        role?: String,
-        groups?: Set<String>,
-        employee_type?: String,
-    };
+/// Supports both Cedar's native schema syntax and JSON schema format.
+pub fn load_schema(path: impl AsRef<Path>) -> CedarResult<Schema> {
+    let path = path.as_ref();
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        CedarError::SchemaParse(format!("Failed to read schema file {:?}: {}", path, e))
+    })?;
 
-    entity Employee = {
-        name: String,
-        role: String,
-        employee_type: String,
-    };
-
-    entity Project = {
-        status: String,
-        name?: String,
-    };
-
-    entity Workstream = {
-        status?: String,
-        priority?: String,
-        name?: String,
-    };
-
-    entity Task = {
-        status?: String,
-        priority?: String,
-        assignee?: String,
-        project_id?: String,
-        workstream_id?: String,
-    };
-
-    entity Asset = {
-        asset_type?: String,
-        status?: String,
-        priority?: String,
-        scope?: String,
-    };
-
-    action View appliesTo {
-        principal: [User, Employee],
-        resource: [Project, Workstream, Task, Asset],
-    };
-    action Create appliesTo {
-        principal: [User, Employee],
-        resource: [Project, Workstream, Task, Asset],
-    };
-    action Edit appliesTo {
-        principal: [User, Employee],
-        resource: [Project, Workstream, Task, Asset],
-    };
-    action Delete appliesTo {
-        principal: [User, Employee],
-        resource: [Project, Workstream, Task, Asset],
-    };
-    action Manage appliesTo {
-        principal: [User, Employee],
-        resource: [Project, Workstream, Task, Asset],
-    };
+    parse_schema(&content).map_err(|e| {
+        CedarError::SchemaParse(format!(
+            "Failed to parse schema file {:?}: {}",
+            path, e
+        ))
+    })
 }
-"#;
 
-/// Schema using simple entity types without a namespace (for simpler policy authoring)
-pub const SIMPLE_CEDAR_SCHEMA: &str = r#"
-entity User = {
-    email?: String,
-    role?: String,
-    groups?: Set<String>,
-    employee_type?: String,
-};
+/// Parse a Cedar schema from a string.
+///
+/// Accepts both Cedar native syntax and JSON format.
+pub fn parse_schema(src: &str) -> CedarResult<Schema> {
+    src.parse()
+        .map_err(|e| CedarError::SchemaParse(format!("{}", e)))
+}
 
-entity Employee = {
-    name: String,
-    role: String,
-    employee_type: String,
-};
+/// Validate that a policy set conforms to a schema.
+///
+/// Returns `Ok(())` if validation passes with no errors.
+/// Returns `Err` with all validation errors if any are found.
+pub fn validate_policies(
+    schema: &Schema,
+    policies: &cedar_policy::PolicySet,
+) -> CedarResult<()> {
+    let validator = cedar_policy::Validator::new(schema.clone());
+    let result = validator.validate(policies, cedar_policy::ValidationMode::default());
 
-entity Project = {
-    status: String,
-    name?: String,
-};
+    if result.validation_passed() {
+        Ok(())
+    } else {
+        let errors: Vec<String> = result
+            .validation_errors()
+            .map(|e| format!("{}", e))
+            .collect();
+        let warnings: Vec<String> = result
+            .validation_warnings()
+            .map(|w| format!("{}", w))
+            .collect();
 
-entity Workstream = {
-    status?: String,
-    priority?: String,
-    name?: String,
-};
+        let mut msg = String::new();
+        if !errors.is_empty() {
+            msg.push_str(&format!("Errors:\n{}", errors.join("\n")));
+        }
+        if !warnings.is_empty() {
+            if !msg.is_empty() {
+                msg.push_str("\n");
+            }
+            msg.push_str(&format!("Warnings:\n{}", warnings.join("\n")));
+        }
 
-entity Task = {
-    status?: String,
-    priority?: String,
-    assignee?: String,
-    project_id?: String,
-    workstream_id?: String,
-};
-
-entity Asset = {
-    asset_type?: String,
-    status?: String,
-    priority?: String,
-    scope?: String,
-};
-
-action View appliesTo {
-    principal: [User, Employee],
-    resource: [Project, Workstream, Task, Asset],
-};
-action Create appliesTo {
-    principal: [User, Employee],
-    resource: [Project, Workstream, Task, Asset],
-};
-action Edit appliesTo {
-    principal: [User, Employee],
-    resource: [Project, Workstream, Task, Asset],
-};
-action Delete appliesTo {
-    principal: [User, Employee],
-    resource: [Project, Workstream, Task, Asset],
-};
-action Manage appliesTo {
-    principal: [User, Employee],
-    resource: [Project, Workstream, Task, Asset],
-};
-"#;
+        Err(CedarError::Validation(msg))
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_default_schema_is_valid() {
-        let schema: cedar_policy::Schema = DEFAULT_CEDAR_SCHEMA
-            .parse()
-            .expect("Default Cedar schema should parse successfully");
-        // Basic sanity check — schema was constructed without error
+    fn test_parse_simple_schema() {
+        let schema_str = r#"
+            entity User = {
+                email?: String,
+                role?: String,
+            };
+
+            entity Document = {
+                status: String,
+                owner?: String,
+            };
+
+            action View, Edit, Delete appliesTo {
+                principal: [User],
+                resource: [Document],
+            };
+        "#;
+        let schema = parse_schema(schema_str).expect("Schema should parse");
         drop(schema);
     }
 
     #[test]
-    fn test_simple_schema_is_valid() {
-        let schema: cedar_policy::Schema = SIMPLE_CEDAR_SCHEMA
-            .parse()
-            .expect("Simple Cedar schema should parse successfully");
+    fn test_parse_namespaced_schema() {
+        let schema_str = r#"
+            namespace MyService {
+                entity User = {
+                    email?: String,
+                };
+
+                entity Resource = {
+                    name: String,
+                };
+
+                action View appliesTo {
+                    principal: [User],
+                    resource: [Resource],
+                };
+            }
+        "#;
+        let schema = parse_schema(schema_str).expect("Namespaced schema should parse");
         drop(schema);
+    }
+
+    #[test]
+    fn test_parse_minimal_schema() {
+        // Minimal valid schema — just an entity, no actions
+        let schema_str = r#"
+            entity User;
+        "#;
+        let schema = parse_schema(schema_str).expect("Minimal schema should parse");
+        drop(schema);
+    }
+
+    #[test]
+    fn test_parse_invalid_schema_fails() {
+        let result = parse_schema("this is not a valid schema!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_policies_against_schema() {
+        let schema_str = r#"
+            entity User = {
+                role?: String,
+            };
+            entity Doc = {};
+            action View appliesTo {
+                principal: [User],
+                resource: [Doc],
+            };
+        "#;
+        let schema = parse_schema(schema_str).unwrap();
+
+        let policy_str = r#"
+            permit(
+                principal == User::"alice",
+                action == Action::"View",
+                resource == Doc::"doc1"
+            );
+        "#;
+        let policies: cedar_policy::PolicySet = policy_str.parse().unwrap();
+
+        // Should validate successfully
+        assert!(validate_policies(&schema, &policies).is_ok());
+    }
+
+    #[test]
+    fn test_load_nonexistent_schema_fails() {
+        let result = load_schema("/nonexistent/path/schema.cedarschema");
+        assert!(result.is_err());
     }
 }

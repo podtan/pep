@@ -5,8 +5,8 @@
 //!
 //! - **`CedarAuthorizer`**: Loads Cedar policies and evaluates authorization requests
 //! - **`CedarConfig`**: TOML-based configuration for policy paths and settings
+//! - **`SchemaLoader`**: Loads Cedar schemas from `.cedarschema` files
 //! - **Entity building**: Converts `JwtClaims` and resource metadata into Cedar entities
-//! - **Schema definitions**: Cedar schema for Tanbal entities (User, Project, Task, etc.)
 //!
 //! Cedar sits after PEP's JWT authentication layer:
 //!
@@ -15,6 +15,9 @@
 //!           "Who are you?"          "Can you do this?"        "Here's the data"
 //! ```
 //!
+//! Each service defines its **own** schema in a `.cedarschema` file — PEP does not
+//! bake any domain-specific entity types into the library.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -22,7 +25,11 @@
 //! use pep::oidc::types::JwtClaims;
 //! use cedar_policy::{Request, Context};
 //!
-//! let config = CedarConfig::from_file("policies/cedar.toml")?;
+//! let config = CedarConfig {
+//!     policy_path: "./policies".into(),
+//!     schema_path: Some("./policies/schema.cedarschema".into()),
+//!     ..Default::default()
+//! };
 //! let authorizer = CedarAuthorizer::new(config)?;
 //!
 //! let principal = build_principal_uid(&claims)?;
@@ -44,4 +51,4 @@ pub use authorizer::CedarAuthorizer;
 pub use config::CedarConfig;
 pub use entity::{ResourceInfo, build_principal_uid, build_principal_entity, build_action_uid};
 pub use error::CedarError;
-pub use schema::{DEFAULT_CEDAR_SCHEMA, SIMPLE_CEDAR_SCHEMA};
+pub use schema::{load_schema, parse_schema, validate_policies};
