@@ -26,6 +26,7 @@
 
 use cedar_policy::{Authorizer, Decision, Entities, PolicySet, Request, Response, Schema, Validator, ValidationMode};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use super::config::CedarConfig;
@@ -211,13 +212,23 @@ impl CedarAuthorizer {
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown");
-            let policy_id = cedar_policy::PolicyId::new(format!("file_{}", file_stem));
-            let policy = cedar_policy::Policy::parse(Some(policy_id), &content).map_err(|e| {
+            let source = PolicySet::from_str(&content).map_err(|e| {
                 CedarError::PolicyLoad(format!("Failed to parse policy file {:?}: {}", path, e))
             })?;
-            policy_set.add(policy).map_err(|e| {
-                CedarError::PolicyLoad(format!("Failed to add policy from {:?}: {}", path, e))
-            })?;
+            for policy in source.policies() {
+                let new_id = cedar_policy::PolicyId::new(format!(
+                    "file_{}_{}",
+                    file_stem,
+                    policy.id().to_string().trim_start_matches("policy")
+                ));
+                let text = policy.to_string();
+                let reparsed = cedar_policy::Policy::parse(Some(new_id), &text).map_err(|e| {
+                    CedarError::PolicyLoad(format!("Failed to re-parse policy from {:?}: {}", path, e))
+                })?;
+                policy_set.add(reparsed).map_err(|e| {
+                    CedarError::PolicyLoad(format!("Failed to add policy from {:?}: {}", path, e))
+                })?;
+            }
         } else {
             return Err(CedarError::PolicyLoad(format!(
                 "Policy path does not exist: {:?}",
@@ -261,23 +272,33 @@ impl CedarAuthorizer {
                 let content = std::fs::read_to_string(&path)
                     .map_err(|e| CedarError::PolicyLoad(format!("Failed to read policy file {:?}: {}", path, e)))?;
 
-                let file_stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown");
+                // Parse the entire file as a PolicySet (supports multiple policies per file).
+                // Cedar's PolicySet::from_str() handles single or multiple policies, as well
+                // as comments and blank lines, so we prefer it over Policy::parse().
+                let file_policy_set: PolicySet = content.parse().map_err(|e| {
+                    CedarError::PolicyLoad(format!(
+                        "Failed to parse policy file {:?}: {}",
+                        path, e
+                    ))
+                })?;
 
-                let policy_id = cedar_policy::PolicyId::new(format!("file_{}_{}", file_stem, count));
-                let policy = cedar_policy::Policy::parse(Some(policy_id), &content)
-                    .map_err(|e| {
-                        CedarError::PolicyLoad(format!(
-                            "Failed to parse policy file {:?}: {}",
-                            path, e
-                        ))
-                    })?;
-                policy_set
-                    .add(policy)
-                    .map_err(|e| CedarError::PolicyLoad(format!("Failed to add policy from {:?}: {}", path, e)))?;
-                count += 1;
+                for policy in file_policy_set.policies() {
+                    // Re-key each policy with a deterministic id derived from the file name
+                    let new_id = cedar_policy::PolicyId::new(format!(
+                        "file_{}_{}",
+                        path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown"),
+                        count
+                    ));
+                    let re_parsed = cedar_policy::Policy::parse(Some(new_id), policy.to_string().as_str())
+                        .map_err(|e| CedarError::PolicyLoad(format!(
+                            "Failed to re-parse policy {} from {:?}: {}",
+                            policy.id(), path, e
+                        )))?;
+                    policy_set
+                        .add(re_parsed)
+                        .map_err(|e| CedarError::PolicyLoad(format!("Failed to add policy from {:?}: {}", path, e)))?;
+                    count += 1;
+                }
             }
         }
 
