@@ -33,6 +33,9 @@ pub enum PepError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error("Userinfo endpoint error: {0}")]
+    Userinfo(String),
+
     #[error("Internal error: {0}")]
     Internal(#[from] anyhow::Error),
 }
@@ -49,7 +52,7 @@ impl PepError {
             PepError::AuthenticationRequired => StatusCode::UNAUTHORIZED,
             PepError::AuthorizationFailed(_) => StatusCode::FORBIDDEN,
             PepError::JwtValidation(_) => StatusCode::UNAUTHORIZED,
-            PepError::OidcDiscovery(_) | PepError::JwksFetch(_) => StatusCode::BAD_GATEWAY,
+            PepError::OidcDiscovery(_) | PepError::JwksFetch(_) | PepError::Userinfo(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

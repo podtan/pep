@@ -1,6 +1,6 @@
 //! Resource server functionality for JWT validation and API protection
 
-use std::{collections::HashMap, sync::Arc, time::{Duration, SystemTime}};
+use std::{collections::HashMap, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use jsonwebtoken::jwk::JwkSet;
 use reqwest::Client;
@@ -9,6 +9,96 @@ use tracing;
 
 use crate::error::{PepError, Result};
 use super::types::{JwtClaims, OidcDiscoveryDocument, CachedJwks, CachedDiscoveryRaw, JwtValidationOptions};
+
+/// Cache entry for userinfo endpoint responses
+#[derive(Clone)]
+pub struct CachedUserInfo {
+    /// The userinfo claims
+    pub claims: serde_json::Map<String, serde_json::Value>,
+    /// When the entry was cached
+    pub cached_at: SystemTime,
+    /// TTL in seconds (derived from token expiry)
+    pub ttl_secs: u64,
+}
+
+impl CachedUserInfo {
+    /// Check if this cache entry has expired
+    pub fn is_expired(&self) -> bool {
+        self.cached_at.elapsed().unwrap_or(Duration::from_secs(self.ttl_secs + 1)) >= Duration::from_secs(self.ttl_secs)
+    }
+}
+
+/// In-memory cache for OIDC userinfo responses.
+///
+/// Keyed by JWT `jti` (token ID) when available, falling back to `sub` (subject).
+/// Entries auto-expire based on the remaining token lifetime.
+#[derive(Clone)]
+pub struct UserInfoCache {
+    inner: Arc<RwLock<HashMap<String, CachedUserInfo>>>,
+}
+
+impl UserInfoCache {
+    /// Create a new empty userinfo cache
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Get cached userinfo if present and not expired
+    pub async fn get(&self, key: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+        let cache = self.inner.read().await;
+        cache.get(key).and_then(|entry| {
+            if entry.is_expired() {
+                None
+            } else {
+                Some(entry.claims.clone())
+            }
+        })
+    }
+
+    /// Store userinfo claims with a TTL derived from token expiry
+    pub async fn insert(
+        &self,
+        key: String,
+        claims: serde_json::Map<String, serde_json::Value>,
+        token_exp: i64,
+    ) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_secs() as i64;
+
+        // TTL = remaining token lifetime, with a safety margin of 30 seconds
+        let remaining = if token_exp > now {
+            (token_exp - now) as u64
+        } else {
+            0
+        };
+        let ttl_secs = remaining.saturating_sub(30).max(30); // at least 30s, at most token remaining - 30s
+
+        let entry = CachedUserInfo {
+            claims,
+            cached_at: SystemTime::now(),
+            ttl_secs,
+        };
+
+        let mut cache = self.inner.write().await;
+        cache.insert(key, entry);
+    }
+
+    /// Purge expired entries (call periodically to free memory)
+    pub async fn purge_expired(&self) {
+        let mut cache = self.inner.write().await;
+        cache.retain(|_, entry| !entry.is_expired());
+    }
+}
+
+impl Default for UserInfoCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Map a JWK's algorithm parameters to a `jsonwebtoken::Algorithm`
 pub fn jwk_algorithm_to_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Result<Algorithm> {
@@ -35,6 +125,8 @@ pub struct ResourceServerClient {
     pub discovery_cache: Arc<RwLock<HashMap<String, (OidcDiscoveryDocument, SystemTime)>>>,
     /// Discovery document cache (raw JSON for proxying)
     pub discovery_cache_raw: Arc<RwLock<HashMap<String, CachedDiscoveryRaw>>>,
+    /// Userinfo response cache (keyed by jti/sub, TTL = token remaining lifetime)
+    pub userinfo_cache: Arc<UserInfoCache>,
 }
 
 impl ResourceServerClient {
@@ -45,6 +137,7 @@ impl ResourceServerClient {
             jwks_cache: Arc::new(RwLock::new(HashMap::new())),
             discovery_cache: Arc::new(RwLock::new(HashMap::new())),
             discovery_cache_raw: Arc::new(RwLock::new(HashMap::new())),
+            userinfo_cache: Arc::new(UserInfoCache::new()),
         }
     }
 
@@ -281,6 +374,148 @@ impl ResourceServerClient {
     /// Validate JWT token with default options
     pub async fn validate_jwt(&self, token: &str, issuer_url: &str, client_id: &str) -> Result<JwtClaims> {
         self.validate_jwt_with_options(token, issuer_url, client_id, &JwtValidationOptions::default()).await
+    }
+
+    /// Adaptive claims enrichment: fill missing `groups` / `role` from the OIDC `/userinfo` endpoint.
+    ///
+    /// **IdP-agnostic design:**
+    /// 1. If `claims.extra` already contains `groups` or `role`, use them directly (zero cost).
+    /// 2. Otherwise, call the `/userinfo` endpoint with the access token as Bearer.
+    /// 3. Merge `groups` and `role` from userinfo into `claims.extra`.
+    /// 4. Cache the userinfo response by `jti` (or `sub` fallback) until the token expires.
+    ///
+    /// This works with Kanidm (no groups in AT), Keycloak/Auth0 (groups in AT → fast path),
+    /// Okta, Azure AD, Google, and any other OIDC-compliant provider.
+    ///
+    /// # Arguments
+    ///
+    /// * `claims` - The JWT claims returned by `validate_jwt_*`. Mutated in place.
+    /// * `token` - The raw access token string (used as Bearer for the userinfo call).
+    /// * `issuer_url` - The OIDC issuer URL (used to derive the userinfo endpoint).
+    /// * `userinfo_url_override` - Optional explicit userinfo URL. If `None`, the URL is
+    ///   derived from the discovery document's `userinfo_endpoint`, falling back to
+    ///   `{issuer_url}/userinfo`.
+    pub async fn enrich_claims_with_userinfo(
+        &self,
+        claims: &mut JwtClaims,
+        token: &str,
+        issuer_url: &str,
+        userinfo_url_override: Option<&str>,
+    ) -> Result<()> {
+        // Fast path: claims already have groups or role — nothing to enrich.
+        let has_groups = claims.extra.contains_key("groups");
+        let has_role = claims.extra.contains_key("role");
+
+        if has_groups && has_role {
+            tracing::debug!("Claims already contain groups and role — skipping userinfo enrichment");
+            return Ok(());
+        }
+
+        tracing::debug!(
+            has_groups, has_role,
+            "Claims missing groups/role — attempting userinfo enrichment"
+        );
+
+        // Build cache key from jti (if present in extra) or sub
+        let cache_key = claims
+            .extra
+            .get("jti")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| claims.sub.clone());
+
+        // Check userinfo cache first
+        if let Some(cached_claims) = self.userinfo_cache.get(&cache_key).await {
+            tracing::debug!(cache_key = %cache_key, "Using cached userinfo for claims enrichment");
+            merge_userinfo_into_claims(claims, &cached_claims);
+            return Ok(());
+        }
+
+        // Resolve the userinfo endpoint URL
+        let userinfo_url = match userinfo_url_override {
+            Some(url) => url.to_string(),
+            None => {
+                // Try discovery document first (has the canonical userinfo_endpoint)
+                match self.get_discovery_document(issuer_url).await {
+                    Ok(doc) if doc.userinfo_endpoint.is_some() => {
+                        doc.userinfo_endpoint.unwrap()
+                    }
+                    Ok(_) => {
+                        // Fallback: derive from issuer URL
+                        format!("{}/userinfo", issuer_url.trim_end_matches('/'))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to fetch discovery for userinfo URL: {}. Deriving from issuer.", e);
+                        format!("{}/userinfo", issuer_url.trim_end_matches('/'))
+                    }
+                }
+            }
+        };
+
+        tracing::debug!(userinfo_url = %userinfo_url, "Calling userinfo endpoint for claims enrichment");
+
+        // Call the userinfo endpoint with the access token as Bearer
+        let response = self.http_client
+            .get(&userinfo_url)
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| PepError::Userinfo(format!("Userinfo request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                userinfo_url = %userinfo_url, status = %status,
+                "Userinfo endpoint returned error: {}", body
+            );
+            // Non-fatal: enrichment failed but JWT is still valid.
+            // Return Ok so the request proceeds with whatever claims we have.
+            return Ok(());
+        }
+
+        let userinfo: serde_json::Map<String, serde_json::Value> = response
+            .json()
+            .await
+            .map_err(|e| PepError::Userinfo(format!("Failed to parse userinfo response: {}", e)))?;
+
+        tracing::debug!(
+            userinfo_keys = ?userinfo.keys().collect::<Vec<_>>(),
+            "Userinfo response received"
+        );
+
+        // Cache the userinfo response (TTL = remaining token lifetime)
+        self.userinfo_cache.insert(cache_key.clone(), userinfo.clone(), claims.exp).await;
+
+        // Merge userinfo claims into JWT claims
+        merge_userinfo_into_claims(claims, &userinfo);
+
+        Ok(())
+    }
+}
+
+/// Merge select fields from the userinfo endpoint response into JWT claims `extra`.
+///
+/// Only merges fields that are relevant for authorization decisions (`groups`, `role`)
+/// and are not already present in `claims.extra`. This avoids overwriting values that
+/// the IdP may have already put into the access token.
+fn merge_userinfo_into_claims(
+    claims: &mut JwtClaims,
+    userinfo: &serde_json::Map<String, serde_json::Value>,
+) {
+    let fields_to_merge = ["groups", "role"];
+    for field in &fields_to_merge {
+        if !claims.extra.contains_key(*field) {
+            if let Some(value) = userinfo.get(*field) {
+                claims.extra.insert(field.to_string(), value.clone());
+                tracing::debug!(
+                    field,
+                    value = %value,
+                    "Merged field from userinfo into claims"
+                );
+            }
+        }
     }
 }
 

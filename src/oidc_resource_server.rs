@@ -5,3 +5,4 @@
 
 pub use crate::oidc::resource_server::*;
 pub use crate::oidc::types::{JwtClaims, ResourceServerConfig, JwtValidationOptions};
+pub use crate::oidc::resource_server::{CachedUserInfo, UserInfoCache};
