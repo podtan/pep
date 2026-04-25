@@ -402,19 +402,17 @@ impl ResourceServerClient {
         issuer_url: &str,
         userinfo_url_override: Option<&str>,
     ) -> Result<()> {
-        // Fast path: claims already have groups or role — nothing to enrich.
+        // Fast path: claims already have groups — sufficient for authorization.
+        // `role` is an application-level concept not issued by standard OIDC providers,
+        // so requiring it here would cause unnecessary userinfo calls on every request.
         let has_groups = claims.extra.contains_key("groups");
-        let has_role = claims.extra.contains_key("role");
 
-        if has_groups && has_role {
-            tracing::debug!("Claims already contain groups and role — skipping userinfo enrichment");
+        if has_groups {
+            tracing::debug!("Claims already contain groups — skipping userinfo enrichment");
             return Ok(());
         }
 
-        tracing::debug!(
-            has_groups, has_role,
-            "Claims missing groups/role — attempting userinfo enrichment"
-        );
+        tracing::debug!("Claims missing groups — attempting userinfo enrichment");
 
         // Build cache key from jti (if present in extra) or sub
         let cache_key = claims
