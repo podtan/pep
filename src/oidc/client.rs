@@ -199,6 +199,56 @@ impl OidcClient {
         use uuid::Uuid;
         Uuid::new_v4().to_string()
     }
+
+    /// Exchange a token for a new token scoped to a different audience (RFC 8693).
+    ///
+    /// Sends a `urn:ietf:params:oauth:grant-type:token-exchange` request to the
+    /// token endpoint, trading `subject_token` for an access token scoped to
+    /// `audience`.  `client_id` / `client_secret` are used for client auth.
+    pub async fn exchange_token(
+        &self,
+        issuer_url: &str,
+        client_id: &str,
+        client_secret: Option<&str>,
+        subject_token: &str,
+        audience: &str,
+    ) -> Result<TokenResponse> {
+        let discovery = self.get_discovery_document(issuer_url).await?;
+        let endpoint = discovery.token_endpoint
+            .ok_or_else(|| PepError::BadRequest("No token endpoint in discovery document".to_string()))?;
+
+        let mut params = HashMap::new();
+        params.insert("grant_type",      "urn:ietf:params:oauth:grant-type:token-exchange".to_string());
+        params.insert("client_id",       client_id.to_string());
+        params.insert("subject_token",   subject_token.to_string());
+        params.insert("subject_token_type", "urn:ietf:params:oauth:token-type:access_token".to_string());
+        params.insert("audience",        audience.to_string());
+
+        let mut req = self.http_client
+            .post(&endpoint)
+            .header("Content-Type", "application/x-www-form-urlencoded");
+
+        if let Some(secret) = client_secret {
+            use base64::engine::general_purpose::STANDARD;
+            let creds = STANDARD.encode(format!("{}:{}", client_id, secret));
+            req = req.header("Authorization", format!("Basic {}", creds));
+        }
+
+        let resp = req
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| PepError::BadRequest(format!("Token exchange request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(PepError::BadRequest(format!("Token exchange failed: {}", body)));
+        }
+
+        resp.json::<TokenResponse>()
+            .await
+            .map_err(|e| PepError::BadRequest(format!("Failed to parse token exchange response: {}", e)))
+    }
 }
 
 impl Default for OidcClient {
