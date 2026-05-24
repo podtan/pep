@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-06-09
+
+### Added
+- feat(token-provider): new `token_provider` module for managing authentication token lifecycle
+  - `TokenProvider` trait with native Rust 1.75+ async fn (no `async-trait` crate)
+  - `StaticTokenProvider` — wraps a static string token
+  - `ServiceAccountTokenProvider` — RFC 8693 token exchange with automatic caching and refresh
+  - `InteractiveTokenProvider` — stub for future browser PKCE flow
+  - `TokenProviderEnum` — enum dispatch over all variants (no `Box<dyn>` needed)
+  - `ServiceAccountConfig` struct for configuring service account token exchange
+  - Gated behind `token-provider` feature (requires `oidc-client` feature)
+  - 10 unit tests, all passing
+
+### Fixed
+- fix(oidc): `exchange_token()` now accepts and sends optional `scope` parameter in the token exchange request body (was missing, causing `invalid_request` errors from Kanidm)
+
 ## [0.3.0] - 2026-03-08
 
 ### Added

@@ -1,6 +1,6 @@
 [package]
 name = "pep"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Policy Enforcement Point - OIDC authentication and authorization library"
 license = "MIT OR Apache-2.0"
@@ -63,6 +63,7 @@ config = ["dep:toml"]
 authorization = ["oidc-resource-server", "axum", "dep:tower"]
 rfc9728 = ["axum"]
 cedar = ["dep:cedar-policy", "oidc-resource-server"]
+token-provider = ["oidc-client"]
 
 [package.metadata.docs.rs]
 all-features = true

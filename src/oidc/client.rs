@@ -212,6 +212,7 @@ impl OidcClient {
         client_secret: Option<&str>,
         subject_token: &str,
         audience: &str,
+        scope: Option<&str>,
     ) -> Result<TokenResponse> {
         let discovery = self.get_discovery_document(issuer_url).await?;
         let endpoint = discovery.token_endpoint
@@ -223,6 +224,9 @@ impl OidcClient {
         params.insert("subject_token",   subject_token.to_string());
         params.insert("subject_token_type", "urn:ietf:params:oauth:token-type:access_token".to_string());
         params.insert("audience",        audience.to_string());
+        if let Some(scope) = scope {
+            params.insert("scope", scope.to_string());
+        }
 
         let mut req = self.http_client
             .post(&endpoint)

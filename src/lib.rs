@@ -106,6 +106,17 @@ pub mod cedar;
 #[cfg(feature = "cedar")]
 pub use cedar::{CedarAuthorizer, CedarConfig, CedarError};
 
+// Token provider module for client-side token lifecycle management
+#[cfg(feature = "token-provider")]
+pub mod token_provider;
+
+// Re-export token provider types
+#[cfg(feature = "token-provider")]
+pub use token_provider::{
+    TokenProvider, TokenProviderEnum,
+    StaticTokenProvider, ServiceAccountTokenProvider, ServiceAccountConfig,
+};
+
 #[cfg(test)]
 mod tests {
     use crate::error::PepError;
