@@ -200,6 +200,60 @@ impl OidcClient {
         Uuid::new_v4().to_string()
     }
 
+    /// Exchange a refresh token for a new access token.
+    ///
+    /// Uses the OAuth2 refresh token grant (RFC 6749 §6).
+    ///
+    /// The provider may rotate the refresh token — always check the
+    /// `refresh_token` field in the returned [`TokenResponse`] and update
+    /// your storage if it differs from the one you sent.
+    pub async fn refresh_access_token(
+        &self,
+        issuer_url: &str,
+        client_id: &str,
+        client_secret: Option<&str>,
+        refresh_token: &str,
+        scope: Option<&str>,
+    ) -> Result<TokenResponse> {
+        let discovery = self.get_discovery_document(issuer_url).await?;
+        let endpoint = discovery.token_endpoint
+            .ok_or_else(|| PepError::BadRequest("No token endpoint in discovery document".to_string()))?;
+
+        let mut params = HashMap::new();
+        params.insert("grant_type", "refresh_token".to_string());
+        params.insert("refresh_token", refresh_token.to_string());
+        params.insert("client_id", client_id.to_string());
+        if let Some(scope) = scope {
+            params.insert("scope", scope.to_string());
+        }
+
+        let mut req = self.http_client
+            .post(&endpoint)
+            .header("Content-Type", "application/x-www-form-urlencoded");
+
+        if let Some(secret) = client_secret {
+            use base64::engine::general_purpose::STANDARD;
+            let creds = STANDARD.encode(format!("{}:{}", client_id, secret));
+            req = req.header("Authorization", format!("Basic {}", creds));
+        }
+
+        let resp = req
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| PepError::BadRequest(format!("Token refresh request failed: {}", e)))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(PepError::TokenRefreshFailed { status, detail: body });
+        }
+
+        resp.json::<TokenResponse>()
+            .await
+            .map_err(|e| PepError::BadRequest(format!("Failed to parse token refresh response: {}", e)))
+    }
+
     /// Exchange a token for a new token scoped to a different audience (RFC 8693).
     ///
     /// Sends a `urn:ietf:params:oauth:grant-type:token-exchange` request to the

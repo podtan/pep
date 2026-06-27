@@ -33,6 +33,9 @@ pub enum PepError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error("Token refresh failed: {status} {detail}")]
+    TokenRefreshFailed { status: u16, detail: String },
+
     #[error("Userinfo endpoint error: {0}")]
     Userinfo(String),
 
