@@ -14,6 +14,7 @@ use tracing;
 
 use crate::error::{PepError, Result};
 use crate::oidc_client::{OidcClient, TokenResponse};
+use crate::token_store::{TokenStore, StoredToken};
 
 // ---------------------------------------------------------------------------
 // Trait
@@ -228,19 +229,26 @@ pub struct InteractiveConfig {
     pub redirect_uri: String,
     /// OAuth2 scopes to request.
     pub scope: String,
+    /// Credential name used as the key for [`TokenStore`].
+    ///
+    /// This is the name under which tokens are saved/loaded (e.g. `"kanidm_interactive"`).
+    pub credential_name: String,
 }
 
 /// Token provider for interactive browser-based login using Authorization
 /// Code Flow with PKCE.
 ///
-/// **Note:** This is currently a stub. Full implementation requires a local
-/// HTTP server to handle the redirect callback.
+/// This provider loads tokens from a [`TokenStore`] (populated by an external
+/// login flow such as `trustee mcp auth`). If the access token is expired, it
+/// attempts a silent refresh using the stored refresh token.
+///
+/// The provider does **not** open a browser — that is the caller's
+/// responsibility. It assumes tokens have already been obtained and stored.
 #[derive(Clone)]
 pub struct InteractiveTokenProvider {
-    #[allow(dead_code)]
-    config: InteractiveConfig,
-    #[allow(dead_code)]
     oidc_client: OidcClient,
+    config: InteractiveConfig,
+    token_store: Arc<dyn TokenStore>,
     cache: Arc<RwLock<Option<CachedToken>>>,
 }
 
@@ -248,16 +256,21 @@ impl std::fmt::Debug for InteractiveTokenProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InteractiveTokenProvider")
             .field("issuer_url", &self.config.issuer_url)
+            .field("credential_name", &self.config.credential_name)
             .finish()
     }
 }
 
 impl InteractiveTokenProvider {
-    /// Create a new interactive token provider (stub).
-    pub fn new(config: InteractiveConfig) -> Self {
+    /// Create a new interactive token provider with the given config and token store.
+    ///
+    /// Tokens are loaded from / saved to the [`TokenStore`] under
+       /// `config.credential_name`.
+    pub fn with_store(config: InteractiveConfig, token_store: Arc<dyn TokenStore>) -> Self {
         Self {
             oidc_client: OidcClient::new(),
             config,
+            token_store,
             cache: Arc::new(RwLock::new(None)),
         }
     }
@@ -265,7 +278,7 @@ impl InteractiveTokenProvider {
 
 impl TokenProvider for InteractiveTokenProvider {
     async fn get_token(&self) -> Result<String> {
-        // Check cache first
+        // 1. Fast path: check in-memory cache
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.as_ref() {
@@ -275,18 +288,161 @@ impl TokenProvider for InteractiveTokenProvider {
             }
         }
 
-        // TODO: Implement browser-based PKCE flow
-        // 1. Generate code_verifier + code_challenge
-        // 2. Build authorization URL
-        // 3. Open browser
-        // 4. Start local HTTP server to catch redirect
-        // 5. Exchange code for tokens
-        // 6. Cache result
+        // 2. Load from token store
+        let stored = self.token_store.load(&self.config.credential_name)?;
 
-        Err(PepError::BadRequest(
-            "InteractiveTokenProvider: not yet implemented".to_string(),
-        ))
+        let stored = match stored {
+            Some(s) => s,
+            None => {
+                return Err(PepError::BadRequest(format!(
+                    "Not authenticated. Run: trustee mcp auth {}",
+                    self.config.credential_name
+                )));
+            }
+        };
+
+        // 3. If access token is still valid, use it
+        if !stored.is_expired() {
+            let cached = CachedToken {
+                token: stored.access_token.clone(),
+                expires_at: Instant::now()
+                    + Duration::from_secs(
+                        seconds_until_expiry(&stored.expires_at).max(1),
+                    ),
+            };
+            let token = cached.token.clone();
+            {
+                let mut cache = self.cache.write().await;
+                *cache = Some(cached);
+            }
+            return Ok(token);
+        }
+
+        // 4. Access token expired — try refresh
+        let refresh_token = match &stored.refresh_token {
+            Some(rt) => rt.clone(),
+            None => {
+                return Err(PepError::BadRequest(format!(
+                    "Session expired. Run: trustee mcp auth {}",
+                    self.config.credential_name
+                )));
+            }
+        };
+
+        tracing::debug!(
+            "Refreshing expired token for credential '{}'",
+            self.config.credential_name
+        );
+
+        let response = self
+            .oidc_client
+            .refresh_access_token(
+                &self.config.issuer_url,
+                &self.config.client_id,
+                self.config.client_secret.as_deref(),
+                &refresh_token,
+                Some(&self.config.scope),
+            )
+            .await;
+
+        match response {
+            Ok(token_response) => {
+                // Build updated StoredToken
+                let new_expires_at = compute_expires_at(token_response.expires_in);
+                let updated = StoredToken::new(
+                    &token_response.access_token,
+                    token_response.refresh_token.clone().or(Some(refresh_token)),
+                    &token_response.token_type,
+                    &new_expires_at,
+                    token_response.scope.clone().or(stored.scope.clone()),
+                );
+
+                // Persist updated tokens
+                if let Err(e) = self.token_store.save(&self.config.credential_name, &updated) {
+                    tracing::warn!(
+                        "Failed to persist refreshed token: {}. Using in-memory only.",
+                        e
+                    );
+                }
+
+                // Cache in memory
+                let cached = CachedToken::from_response(&token_response);
+                let token = cached.token.clone();
+                {
+                    let mut cache = self.cache.write().await;
+                    *cache = Some(cached);
+                }
+
+                Ok(token)
+            }
+            Err(PepError::TokenRefreshFailed { .. }) => {
+                // Refresh token itself is expired/invalid
+                Err(PepError::BadRequest(format!(
+                    "Session expired. Run: trustee mcp auth {}",
+                    self.config.credential_name
+                )))
+            }
+            Err(e) => Err(e),
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for InteractiveTokenProvider
+// ---------------------------------------------------------------------------
+
+/// Compute the number of seconds until the given RFC-3339 timestamp.
+///
+/// Returns 0 if the timestamp is in the past or cannot be parsed.
+fn seconds_until_expiry(expires_at: &str) -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_epoch = crate::token_store::parse_rfc3339_to_epoch_public(expires_at);
+    expires_epoch.saturating_sub(now)
+}
+
+/// Compute an RFC-3339 timestamp `expires_in` seconds from now.
+fn compute_expires_at(expires_in: Option<u64>) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_epoch = now + expires_in.unwrap_or(900);
+    epoch_to_rfc3339(expires_epoch)
+}
+
+/// Convert epoch seconds to an RFC-3339 UTC timestamp.
+fn epoch_to_rfc3339(epoch: u64) -> String {
+    let days = epoch / 86400;
+    let remainder = epoch % 86400;
+    let hour = remainder / 3600;
+    let min = (remainder % 3600) / 60;
+    let sec = remainder % 60;
+
+    let (year, month, day) = epoch_to_civil(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, min, sec
+    )
+}
+
+/// Convert days-since-epoch to (year, month, day) using Hinnant's algorithm.
+fn epoch_to_civil(days: u64) -> (u32, u32, u32) {
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as u32, m as u32, d as u32)
 }
 
 // ---------------------------------------------------------------------------
@@ -418,5 +574,41 @@ mod tests {
         };
         let _provider = ServiceAccountTokenProvider::new(config);
         // Just verify construction works
+    }
+
+    #[test]
+    fn test_compute_expires_at() {
+        let ts = compute_expires_at(Some(0));
+        assert!(ts.ends_with("Z"));
+        assert_eq!(ts.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
+
+        // Should be approximately "now"
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let parsed = crate::token_store::parse_rfc3339_to_epoch_public(&ts);
+        assert!(parsed <= now_epoch + 1);
+    }
+
+    #[test]
+    fn test_epoch_to_rfc3339_round_trip() {
+        // epoch 0 = 1970-01-01T00:00:00Z
+        assert_eq!(epoch_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        // epoch 86400 = 1970-01-02T00:00:00Z
+        assert_eq!(epoch_to_rfc3339(86400), "1970-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn test_interactive_config_builder() {
+        let config = InteractiveConfig {
+            issuer_url: "https://idm.example.com/oauth2/openid/test".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            redirect_uri: "http://localhost:8765/callback".to_string(),
+            scope: "openid profile".to_string(),
+            credential_name: "test_interactive".to_string(),
+        };
+        assert_eq!(config.credential_name, "test_interactive");
     }
 }

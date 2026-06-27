@@ -92,6 +92,11 @@ fn parse_rfc3339_to_epoch(ts: &str) -> Option<u64> {
     Some(civil_to_epoch(year, month, day, hour, min, sec))
 }
 
+/// Public wrapper for [`parse_rfc3339_to_epoch`] for use by other modules.
+pub(crate) fn parse_rfc3339_to_epoch_public(ts: &str) -> u64 {
+    parse_rfc3339_to_epoch(ts).unwrap_or(0)
+}
+
 /// Convert civil (calendar) time to Unix epoch seconds.
 ///
 /// Uses the well-known Howard Hinnant algorithm. Works for any date

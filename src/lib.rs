@@ -123,6 +123,7 @@ pub mod oauth_callback;
 pub use token_provider::{
     TokenProvider, TokenProviderEnum,
     StaticTokenProvider, ServiceAccountTokenProvider, ServiceAccountConfig,
+    InteractiveConfig, InteractiveTokenProvider,
 };
 
 // Re-export token store types
