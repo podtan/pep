@@ -114,6 +114,10 @@ pub mod token_provider;
 #[cfg(feature = "token-provider")]
 pub mod token_store;
 
+// OAuth callback server module (interactive auth)
+#[cfg(feature = "token-provider")]
+pub mod oauth_callback;
+
 // Re-export token provider types
 #[cfg(feature = "token-provider")]
 pub use token_provider::{
@@ -124,6 +128,10 @@ pub use token_provider::{
 // Re-export token store types
 #[cfg(feature = "token-provider")]
 pub use token_store::{TokenStore, FileTokenStore, StoredToken};
+
+// Re-export OAuth callback server types
+#[cfg(feature = "token-provider")]
+pub use oauth_callback::{CallbackServer, AuthorizationCode};
 
 #[cfg(test)]
 mod tests {
