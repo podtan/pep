@@ -107,7 +107,7 @@ fn civil_to_epoch(year: u32, month: u32, day: u32, hour: u32, min: u32, sec: u32
     let yoe = (y - era * 400) as u64; // [0, 399]
     let doy = ((153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1) as u64;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    let days = era as i64 * 146097 + doe as i64 - 719468;
+    let days = era * 146097 + doe as i64 - 719468;
     let total_seconds = days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
     if total_seconds < 0 {
         0

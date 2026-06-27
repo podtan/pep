@@ -73,7 +73,7 @@ pub fn validate_policies(
         }
         if !warnings.is_empty() {
             if !msg.is_empty() {
-                msg.push_str("\n");
+                msg.push('\n');
             }
             msg.push_str(&format!("Warnings:\n{}", warnings.join("\n")));
         }

@@ -268,7 +268,7 @@ impl CedarAuthorizer {
 
             if path.is_dir() {
                 Self::load_policies_from_dir(policy_set, &path)?;
-            } else if path.extension().map_or(false, |ext| ext == "cedar") {
+            } else if path.extension().is_some_and(|ext| ext == "cedar") {
                 let content = std::fs::read_to_string(&path)
                     .map_err(|e| CedarError::PolicyLoad(format!("Failed to read policy file {:?}: {}", path, e)))?;
 
