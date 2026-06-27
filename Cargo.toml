@@ -53,6 +53,9 @@ cedar-policy = { version = "4.9", optional = true }
 # Optional configuration parsing
 toml = { version = "0.8", optional = true }
 
+# Directory resolution for token storage
+dirs = "5"
+
 [features]
 default = []
 oidc = ["oidc-client", "oidc-resource-server"]

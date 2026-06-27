@@ -110,12 +110,20 @@ pub use cedar::{CedarAuthorizer, CedarConfig, CedarError};
 #[cfg(feature = "token-provider")]
 pub mod token_provider;
 
+// Token store module for persistent token storage (interactive auth)
+#[cfg(feature = "token-provider")]
+pub mod token_store;
+
 // Re-export token provider types
 #[cfg(feature = "token-provider")]
 pub use token_provider::{
     TokenProvider, TokenProviderEnum,
     StaticTokenProvider, ServiceAccountTokenProvider, ServiceAccountConfig,
 };
+
+// Re-export token store types
+#[cfg(feature = "token-provider")]
+pub use token_store::{TokenStore, FileTokenStore, StoredToken};
 
 #[cfg(test)]
 mod tests {
