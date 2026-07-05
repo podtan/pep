@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.1 — 2026-07-05
+
+### Added
+
+- `PkceCookieManager` — stateless PKCE state manager using HMAC-SHA256 signed
+  cookies. Eliminates the need for in-memory state stores in multi-instance /
+  load-balanced deployments. Any instance can handle the OIDC callback without
+  shared state.
+- `PkceSession` — result type containing `state`, `verifier`, and a signed
+  `cookie_value` for use as an HttpOnly cookie.
+- Cookie payload format: `base64url(state).base64url(verifier).base64url(expiry).base64url(hmac)`.
+- New dependency: `hmac = "0.12"`.
+
+### Changed
+
+- `oidc::pkce_cookie` module re-exported at `pep::oidc::PkceCookieManager`,
+  `pep::oidc_client::PkceCookieManager`.
+
 ## 0.4.0 — 2026-06-27
 
 ### Added
