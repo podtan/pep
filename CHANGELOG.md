@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.4 — 2026-07-22
+
+### Added
+
+- `WebSessionManager::force_refresh()` — force-refreshes a session's token,
+  ignoring the in-memory cache. Used by callers when JWT validation fails
+  with ExpiredSignature despite the session manager's expiry estimate saying
+  there's time left (clock skew between servers).
+
+### Changed
+
+- Default `refresh_buffer_secs` increased from 60 → 120 seconds to give more
+  margin against clock skew between the application server and the IdP.
+
 ## 0.4.3 — 2026-07-22
 
 ### Added

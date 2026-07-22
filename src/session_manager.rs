@@ -167,7 +167,7 @@ impl std::fmt::Debug for WebSessionManager {
 }
 
 // Convenience constants
-const DEFAULT_REFRESH_BUFFER_SECS: u64 = 60;
+const DEFAULT_REFRESH_BUFFER_SECS: u64 = 120;
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600; // 1 hour
 const DEFAULT_SWEEP_THRESHOLD: usize = 64;
 
@@ -277,6 +277,19 @@ impl WebSessionManager {
     /// * `Err(PepError::AuthenticationRequired)` — Session not found, idle
     ///   timed out, or refresh failed. The caller should redirect to login.
     pub async fn get_token(&self, session_id: &str) -> Result<String> {
+        self._get_token(session_id, false).await
+    }
+
+    /// Force-refresh the token for a session, ignoring the cache.
+    ///
+    /// Use this when a caller knows the cached token is invalid (e.g. JWT
+    /// validation failed with ExpiredSignature despite our expiry estimate
+    /// saying there's time left — clock skew between servers).
+    pub async fn force_refresh(&self, session_id: &str) -> Result<String> {
+        self._get_token(session_id, true).await
+    }
+
+    async fn _get_token(&self, session_id: &str, force_refresh: bool) -> Result<String> {
         // 1. Load session + update last_accessed
         let stored = {
             let mut sessions = self.sessions.write().unwrap();
@@ -314,7 +327,7 @@ impl WebSessionManager {
 
         // 2. Check if token is still valid (with buffer)
         let remaining = seconds_until_expiry(&stored.expires_at);
-        if remaining > self.refresh_buffer_secs {
+        if !force_refresh && remaining > self.refresh_buffer_secs {
             return Ok(stored.access_token);
         }
 
