@@ -130,6 +130,14 @@ pub use token_provider::{
 #[cfg(feature = "token-provider")]
 pub use token_store::{TokenStore, FileTokenStore, StoredToken};
 
+// Web session manager module (server-side session token management)
+#[cfg(feature = "token-provider")]
+pub mod session_manager;
+
+// Re-export session manager types
+#[cfg(feature = "token-provider")]
+pub use session_manager::{WebSessionManager, InMemoryTokenStore};
+
 // Re-export OAuth callback server types
 #[cfg(feature = "token-provider")]
 pub use oauth_callback::{CallbackServer, AuthorizationCode};

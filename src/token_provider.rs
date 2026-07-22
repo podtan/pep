@@ -394,7 +394,7 @@ impl TokenProvider for InteractiveTokenProvider {
 /// Compute the number of seconds until the given RFC-3339 timestamp.
 ///
 /// Returns 0 if the timestamp is in the past or cannot be parsed.
-fn seconds_until_expiry(expires_at: &str) -> u64 {
+pub(crate) fn seconds_until_expiry(expires_at: &str) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -405,7 +405,7 @@ fn seconds_until_expiry(expires_at: &str) -> u64 {
 }
 
 /// Compute an RFC-3339 timestamp `expires_in` seconds from now.
-fn compute_expires_at(expires_in: Option<u64>) -> String {
+pub(crate) fn compute_expires_at(expires_in: Option<u64>) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

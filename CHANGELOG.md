@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.2 — 2026-07-06
+
+### Added
+
+- `WebSessionManager` — server-side session manager for web applications.
+  Maps opaque UUID session IDs to OAuth tokens with automatic refresh.
+  When `get_token()` is called and the access token is near expiry (within
+  a configurable buffer), it transparently refreshes via
+  `OidcClient::refresh_access_token()` and updates the stored token.
+- `InMemoryTokenStore` — in-memory `TokenStore` implementation using
+  `std::sync::RwLock<HashMap>`. Designed for session data that does not
+  need to survive process restarts.
+- `WebSessionManager::create_session()` — stores tokens from a
+  `TokenResponse`, returns a UUID session ID for use as a cookie value.
+- `WebSessionManager::destroy_session()` — removes a session (logout).
+- `WebSessionManager::with_store()` — constructor accepting a custom
+  `Arc<dyn TokenStore>` backend for pluggable persistence.
+
+### Changed
+
+- `compute_expires_at()` and `seconds_until_expiry()` in `token_provider`
+  are now `pub(crate)` so `session_manager` can reuse them.
+
 ## 0.4.1 — 2026-07-05
 
 ### Added
