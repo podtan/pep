@@ -7,32 +7,48 @@
 //! # Design
 //!
 //! ```text
-//! Browser cookie (session_id) ──→ WebSessionManager ──→ server-side token store
+//! Browser cookie (session_id) ──→ WebSessionManager ──→ server-side session map
 //!                                                           │
 //!                                                     auto-refresh via
 //!                                                     OidcClient::refresh_access_token()
+//!                                                           │
+//!                                                     idle timeout sweep
+//!                                                     (amortized on every get_token)
 //! ```
 //!
-//! When [`WebSessionManager::get_token`] is called:
-//! 1. Look up the `StoredToken` by session ID.
-//! 2. If the access token is still valid → return it immediately.
-//! 3. If expired but a refresh token exists → call the IdP token endpoint,
-//!    update the stored token, and return the new access token.
-//! 4. If no refresh token or refresh fails → return an error (caller should
-//!    redirect to login).
+//! ## Session lifecycle
+//!
+//! 1. **Login** → `create_session()` stores tokens + `last_accessed = now`.
+//! 2. **Active request** → `get_token()` returns/refreshes token, updates
+//!    `last_accessed`.
+//! 3. **Idle** → if `last_accessed + idle_timeout` < now, session is swept.
+//! 4. **Logout** → `destroy_session()` removes immediately.
+//! 5. **Refresh failure** → session destroyed, returns `AuthenticationRequired`.
 //!
 //! The session ID is a random UUID — it carries no JWT payload, so it works
 //! regardless of which OAuth2 client signed the original token.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
 use tracing;
 
 use crate::error::{PepError, Result};
 use crate::oidc_client::{OidcClient, TokenResponse};
 use crate::token_provider::{compute_expires_at, seconds_until_expiry};
-use crate::token_store::{StoredToken, TokenStore};
+use crate::token_store::StoredToken;
+
+// ---------------------------------------------------------------------------
+// SessionEntry (internal)
+// ---------------------------------------------------------------------------
+
+/// Internal session entry: token data + access-time tracking.
+#[derive(Clone, Debug)]
+struct SessionEntry {
+    token: StoredToken,
+    last_accessed: Instant,
+}
 
 // ---------------------------------------------------------------------------
 // InMemoryTokenStore
@@ -46,6 +62,11 @@ use crate::token_store::{StoredToken, TokenStore};
 /// Uses `std::sync::RwLock` (not `tokio::sync::RwLock`) because the
 /// `TokenStore` trait methods are synchronous and in-memory operations
 /// are fast enough to not block async tasks meaningfully.
+///
+/// **Note:** For web session management with idle-timeout eviction, use
+/// [`WebSessionManager`] directly — it has its own internal store with
+/// access-time tracking. This type is kept for compatibility with the
+/// [`crate::token_store::TokenStore`] trait (e.g. for `InteractiveTokenProvider`).
 #[derive(Debug, Default)]
 pub struct InMemoryTokenStore {
     sessions: RwLock<HashMap<String, StoredToken>>,
@@ -58,7 +79,7 @@ impl InMemoryTokenStore {
     }
 }
 
-impl TokenStore for InMemoryTokenStore {
+impl crate::token_store::TokenStore for InMemoryTokenStore {
     fn load(&self, name: &str) -> Result<Option<StoredToken>> {
         let sessions = self.sessions.read().unwrap();
         Ok(sessions.get(name).cloned())
@@ -83,14 +104,20 @@ impl TokenStore for InMemoryTokenStore {
 
 /// Server-side session manager for web applications.
 ///
-/// Maps opaque session IDs (UUIDs) to OAuth tokens with automatic refresh.
+/// Maps opaque session IDs (UUIDs) to OAuth tokens with automatic refresh
+/// and idle-timeout eviction.
+///
+/// # Idle timeout
+///
+/// Sessions that have not been accessed for `idle_timeout_secs` (default: 1 hour)
+/// are evicted during an amortized sweep that runs when the session count
+/// exceeds `sweep_threshold` (default: 64).
 ///
 /// # Usage
 ///
 /// ```rust,ignore
 /// use pep::session_manager::WebSessionManager;
 /// use pep::oidc_client::OidcClient;
-/// use std::sync::Arc;
 ///
 /// let mgr = WebSessionManager::new(
 ///     OidcClient::new(),
@@ -108,8 +135,8 @@ impl TokenStore for InMemoryTokenStore {
 /// let access_token = mgr.get_token(&session_id).await.unwrap();
 /// ```
 pub struct WebSessionManager {
-    /// Token storage backend (in-memory by default).
-    store: Arc<dyn TokenStore>,
+    /// Internal session map with access-time tracking.
+    sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
     /// OIDC client for token refresh.
     oidc_client: OidcClient,
     /// Issuer URL (e.g. `https://idm.example.com/oauth2/openid/pdt-api`).
@@ -120,8 +147,12 @@ pub struct WebSessionManager {
     client_secret: Option<String>,
     /// OAuth2 scopes.
     scope: String,
-    /// Refresh token 60 seconds before actual expiry to avoid edge cases.
+    /// Refresh token this many seconds before actual expiry (default: 60).
     refresh_buffer_secs: u64,
+    /// Evict sessions idle for longer than this (default: 3600 = 1 hour).
+    idle_timeout_secs: u64,
+    /// Sweep idle sessions when count exceeds this threshold (default: 64).
+    sweep_threshold: usize,
 }
 
 impl std::fmt::Debug for WebSessionManager {
@@ -130,9 +161,15 @@ impl std::fmt::Debug for WebSessionManager {
             .field("issuer_url", &self.issuer_url)
             .field("client_id", &self.client_id)
             .field("scope", &self.scope)
+            .field("idle_timeout_secs", &self.idle_timeout_secs)
             .finish()
     }
 }
+
+// Convenience constants
+const DEFAULT_REFRESH_BUFFER_SECS: u64 = 60;
+const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 3600; // 1 hour
+const DEFAULT_SWEEP_THRESHOLD: usize = 64;
 
 impl WebSessionManager {
     /// Create a new `WebSessionManager` with an in-memory store.
@@ -152,45 +189,40 @@ impl WebSessionManager {
         scope: String,
     ) -> Self {
         Self {
-            store: Arc::new(InMemoryTokenStore::new()),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
             oidc_client,
             issuer_url,
             client_id,
             client_secret,
             scope,
-            refresh_buffer_secs: 60,
-        }
-    }
-
-    /// Create a new `WebSessionManager` with a custom token store backend.
-    ///
-    /// Use this if you want persistent sessions (e.g. via a future
-    /// `SqliteTokenStore`) or a shared store across multiple instances.
-    pub fn with_store(
-        oidc_client: OidcClient,
-        store: Arc<dyn TokenStore>,
-        issuer_url: String,
-        client_id: String,
-        client_secret: Option<String>,
-        scope: String,
-    ) -> Self {
-        Self {
-            store,
-            oidc_client,
-            issuer_url,
-            client_id,
-            client_secret,
-            scope,
-            refresh_buffer_secs: 60,
+            refresh_buffer_secs: DEFAULT_REFRESH_BUFFER_SECS,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            sweep_threshold: DEFAULT_SWEEP_THRESHOLD,
         }
     }
 
     /// Set the refresh buffer (how many seconds before expiry to trigger a refresh).
     ///
     /// Default: 60 seconds.
-    #[allow(dead_code)]
     pub fn with_refresh_buffer(mut self, secs: u64) -> Self {
         self.refresh_buffer_secs = secs;
+        self
+    }
+
+    /// Set the idle timeout — sessions not accessed for this long are evicted.
+    ///
+    /// Default: 3600 seconds (1 hour).
+    pub fn with_idle_timeout(mut self, secs: u64) -> Self {
+        self.idle_timeout_secs = secs;
+        self
+    }
+
+    /// Set the sweep threshold — amortized cleanup runs when session count
+    /// exceeds this number.
+    ///
+    /// Default: 64.
+    pub fn with_sweep_threshold(mut self, threshold: usize) -> Self {
+        self.sweep_threshold = threshold;
         self
     }
 
@@ -215,9 +247,15 @@ impl WebSessionManager {
             token_response.scope.clone(),
         );
 
-        // InMemoryTokenStore uses blocking_read/blocking_write, so we need
-        // to use spawn_blocking or just call directly (they are fast locks).
-        self.store.save(&session_id, &stored)?;
+        let entry = SessionEntry {
+            token: stored,
+            last_accessed: Instant::now(),
+        };
+
+        {
+            let mut sessions = self.sessions.write().unwrap();
+            sessions.insert(session_id.clone(), entry);
+        }
 
         tracing::debug!(
             session_id = %session_id,
@@ -230,26 +268,53 @@ impl WebSessionManager {
 
     /// Get a valid access token for the given session, refreshing if necessary.
     ///
+    /// Updates `last_accessed` on every successful call. Performs amortized
+    /// idle-session sweep when the session count exceeds the threshold.
+    ///
     /// # Returns
     ///
     /// * `Ok(token)` — A valid access token (possibly freshly refreshed).
-    /// * `Err(PepError::AuthenticationRequired)` — Session not found or
-    ///   refresh failed. The caller should redirect to login.
+    /// * `Err(PepError::AuthenticationRequired)` — Session not found, idle
+    ///   timed out, or refresh failed. The caller should redirect to login.
     pub async fn get_token(&self, session_id: &str) -> Result<String> {
-        let stored = self.store.load(session_id)?;
+        // 1. Load session + update last_accessed
+        let stored = {
+            let mut sessions = self.sessions.write().unwrap();
 
-        let stored = match stored {
-            Some(s) => s,
-            None => {
-                tracing::debug!(session_id = %session_id, "Session not found");
+            // Amortized sweep
+            if sessions.len() > self.sweep_threshold {
+                self.sweep_idle_sessions(&mut sessions);
+            }
+
+            let entry = match sessions.get_mut(session_id) {
+                Some(e) => e,
+                None => {
+                    tracing::debug!(session_id = %session_id, "Session not found");
+                    return Err(PepError::AuthenticationRequired);
+                }
+            };
+
+            // Check idle timeout
+            let idle_secs = entry.last_accessed.elapsed().as_secs();
+            if idle_secs > self.idle_timeout_secs {
+                tracing::debug!(
+                    session_id = %session_id,
+                    idle_secs = idle_secs,
+                    idle_timeout = self.idle_timeout_secs,
+                    "Session idle-expired"
+                );
+                sessions.remove(session_id);
                 return Err(PepError::AuthenticationRequired);
             }
+
+            // Update access time
+            entry.last_accessed = Instant::now();
+            entry.token.clone()
         };
 
-        // Check if token is still valid (with buffer)
+        // 2. Check if token is still valid (with buffer)
         let remaining = seconds_until_expiry(&stored.expires_at);
         if remaining > self.refresh_buffer_secs {
-            // Still valid
             return Ok(stored.access_token);
         }
 
@@ -259,7 +324,7 @@ impl WebSessionManager {
             "Token near expiry, attempting refresh"
         );
 
-        // Need to refresh
+        // 3. Need to refresh
         self.refresh_session(session_id, &stored).await
     }
 
@@ -267,9 +332,15 @@ impl WebSessionManager {
     ///
     /// Call this on logout to invalidate the session immediately.
     pub fn destroy_session(&self, session_id: &str) -> Result<()> {
-        self.store.delete(session_id)?;
+        let mut sessions = self.sessions.write().unwrap();
+        sessions.remove(session_id);
         tracing::debug!(session_id = %session_id, "Session destroyed");
         Ok(())
+    }
+
+    /// Returns the current number of active sessions.
+    pub fn session_count(&self) -> usize {
+        self.sessions.read().unwrap().len()
     }
 
     /// Refresh the token for a session and update the store.
@@ -282,8 +353,8 @@ impl WebSessionManager {
             Some(rt) => rt.clone(),
             None => {
                 tracing::debug!(session_id = %session_id, "No refresh token, cannot refresh");
-                // Clean up the expired session
-                let _ = self.store.delete(session_id);
+                let mut sessions = self.sessions.write().unwrap();
+                sessions.remove(session_id);
                 return Err(PepError::AuthenticationRequired);
             }
         };
@@ -303,7 +374,6 @@ impl WebSessionManager {
             Ok(token_response) => {
                 let new_expires_at = compute_expires_at(token_response.expires_in);
 
-                // Build updated token — providers may rotate the refresh token
                 let updated = StoredToken::new(
                     &token_response.access_token,
                     token_response
@@ -316,7 +386,12 @@ impl WebSessionManager {
                 );
 
                 let access_token = updated.access_token.clone();
-                self.store.save(session_id, &updated)?;
+
+                // Update the session entry (preserves last_accessed)
+                let mut sessions = self.sessions.write().unwrap();
+                if let Some(entry) = sessions.get_mut(session_id) {
+                    entry.token = updated;
+                }
 
                 tracing::info!(
                     session_id = %session_id,
@@ -332,8 +407,8 @@ impl WebSessionManager {
                     status = status,
                     "Token refresh failed: {}", detail
                 );
-                // Refresh token itself is invalid — clean up
-                let _ = self.store.delete(session_id);
+                let mut sessions = self.sessions.write().unwrap();
+                sessions.remove(session_id);
                 Err(PepError::AuthenticationRequired)
             }
             Err(e) => {
@@ -343,6 +418,24 @@ impl WebSessionManager {
                 );
                 Err(e)
             }
+        }
+    }
+
+    /// Sweep idle-expired sessions from the map.
+    ///
+    /// Called inline when the session count exceeds `sweep_threshold`.
+    /// Removes entries where `last_accessed.elapsed() > idle_timeout_secs`.
+    fn sweep_idle_sessions(&self, sessions: &mut HashMap<String, SessionEntry>) {
+        let before = sessions.len();
+        let timeout = std::time::Duration::from_secs(self.idle_timeout_secs);
+        sessions.retain(|_, entry| entry.last_accessed.elapsed() < timeout);
+        let swept = before - sessions.len();
+        if swept > 0 {
+            tracing::info!(
+                swept = swept,
+                remaining = sessions.len(),
+                "Idle session sweep complete"
+            );
         }
     }
 }
@@ -407,99 +500,67 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // WebSessionManager
+    // WebSessionManager — basic
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_create_session_stores_token() {
-        let mgr = WebSessionManager::new(
+    fn make_test_mgr() -> WebSessionManager {
+        WebSessionManager::new(
             OidcClient::new(),
             "https://idm.example.com/oauth2/openid/pdt-api".to_string(),
             "pdt-api".to_string(),
             None,
             "openid profile".to_string(),
-        );
+        )
+    }
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-
-        let token_response = TokenResponse {
-            access_token: "access-abc".to_string(),
+    fn make_token_response(access: &str, refresh: Option<&str>) -> TokenResponse {
+        TokenResponse {
+            access_token: access.to_string(),
             token_type: "Bearer".to_string(),
             expires_in: Some(900),
-            refresh_token: Some("refresh-xyz".to_string()),
+            refresh_token: refresh.map(|s| s.to_string()),
             id_token: None,
             scope: Some("openid profile".to_string()),
-        };
+        }
+    }
 
-        let session_id = rt.block_on(mgr.create_session(&token_response)).unwrap();
+    #[test]
+    fn test_create_session_stores_token() {
+        let mgr = make_test_mgr();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let session_id = rt
+            .block_on(mgr.create_session(&make_token_response("access-abc", Some("refresh-xyz"))))
+            .unwrap();
         assert!(!session_id.is_empty());
-
-        // Should be a valid UUID
         assert!(uuid::Uuid::parse_str(&session_id).is_ok());
     }
 
     #[test]
     fn test_create_two_sessions_have_different_ids() {
-        let mgr = WebSessionManager::new(
-            OidcClient::new(),
-            "https://idm.example.com".to_string(),
-            "client".to_string(),
-            None,
-            "openid".to_string(),
-        );
-
+        let mgr = make_test_mgr();
         let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let token_response = TokenResponse {
-            access_token: "a".to_string(),
-            token_type: "Bearer".to_string(),
-            expires_in: Some(900),
-            refresh_token: None,
-            id_token: None,
-            scope: None,
-        };
-
-        let id1 = rt.block_on(mgr.create_session(&token_response)).unwrap();
-        let id2 = rt.block_on(mgr.create_session(&token_response)).unwrap();
+        let id1 = rt.block_on(mgr.create_session(&make_token_response("a", None))).unwrap();
+        let id2 = rt.block_on(mgr.create_session(&make_token_response("b", None))).unwrap();
         assert_ne!(id1, id2);
     }
 
     #[test]
     fn test_get_token_valid_returns_access_token() {
-        let mgr = WebSessionManager::new(
-            OidcClient::new(),
-            "https://idm.example.com".to_string(),
-            "client".to_string(),
-            None,
-            "openid".to_string(),
-        );
-
+        let mgr = make_test_mgr();
         let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let token_response = TokenResponse {
-            access_token: "my-access-token".to_string(),
-            token_type: "Bearer".to_string(),
-            expires_in: Some(900),
-            refresh_token: Some("my-refresh".to_string()),
-            id_token: None,
-            scope: None,
-        };
-
-        let session_id = rt.block_on(mgr.create_session(&token_response)).unwrap();
+        let session_id = rt
+            .block_on(mgr.create_session(&make_token_response("my-access-token", Some("my-refresh"))))
+            .unwrap();
         let token = rt.block_on(mgr.get_token(&session_id)).unwrap();
         assert_eq!(token, "my-access-token");
     }
 
     #[test]
     fn test_get_token_unknown_session_errors() {
-        let mgr = WebSessionManager::new(
-            OidcClient::new(),
-            "https://idm.example.com".to_string(),
-            "client".to_string(),
-            None,
-            "openid".to_string(),
-        );
-
+        let mgr = make_test_mgr();
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         let result = rt.block_on(mgr.get_token("nonexistent-session"));
@@ -508,136 +569,176 @@ mod tests {
 
     #[test]
     fn test_destroy_session() {
-        let mgr = WebSessionManager::new(
-            OidcClient::new(),
-            "https://idm.example.com".to_string(),
-            "client".to_string(),
-            None,
-            "openid".to_string(),
-        );
-
+        let mgr = make_test_mgr();
         let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let token_response = TokenResponse {
-            access_token: "test-token".to_string(),
-            token_type: "Bearer".to_string(),
-            expires_in: Some(900),
-            refresh_token: None,
-            id_token: None,
-            scope: None,
-        };
+        let session_id = rt
+            .block_on(mgr.create_session(&make_token_response("test-token", None)))
+            .unwrap();
 
-        let session_id = rt.block_on(mgr.create_session(&token_response)).unwrap();
-
-        // Token works
         let token = rt.block_on(mgr.get_token(&session_id)).unwrap();
         assert_eq!(token, "test-token");
 
-        // Destroy
         mgr.destroy_session(&session_id).unwrap();
 
-        // Now it should error
         let result = rt.block_on(mgr.get_token(&session_id));
         assert!(matches!(result, Err(PepError::AuthenticationRequired)));
     }
 
     #[test]
     fn test_get_token_expired_no_refresh_errors() {
-        let mgr = WebSessionManager::new(
-            OidcClient::new(),
-            "https://idm.example.com".to_string(),
-            "client".to_string(),
-            None,
-            "openid".to_string(),
-        );
-
+        let mgr = make_test_mgr();
         let rt = tokio::runtime::Runtime::new().unwrap();
 
-        // Create a session with an already-expired token and no refresh token
+        // Insert a session with an already-expired token and no refresh token
         let stored = StoredToken::new(
             "expired-access",
-            None, // no refresh token
+            None,
             "Bearer",
-            "2020-01-01T00:00:00Z", // past
+            "2020-01-01T00:00:00Z",
             None,
         );
 
-        // Directly store it using the internal store
-        mgr.store.save("expired-session", &stored).unwrap();
+        {
+            let mut sessions = mgr.sessions.write().unwrap();
+            sessions.insert(
+                "expired-session".to_string(),
+                SessionEntry {
+                    token: stored,
+                    last_accessed: Instant::now(),
+                },
+            );
+        }
 
         let result = rt.block_on(mgr.get_token("expired-session"));
         assert!(matches!(result, Err(PepError::AuthenticationRequired)));
     }
 
-    #[test]
-    fn test_session_manager_debug() {
-        let mgr = WebSessionManager::new(
-            OidcClient::new(),
-            "https://idm.example.com".to_string(),
-            "pdt-api".to_string(),
-            None,
-            "openid".to_string(),
-        );
-        let debug_str = format!("{:?}", mgr);
-        assert!(debug_str.contains("WebSessionManager"));
-        assert!(debug_str.contains("pdt-api"));
-    }
+    // -----------------------------------------------------------------------
+    // WebSessionManager — idle timeout + sweep
+    // -----------------------------------------------------------------------
 
     #[test]
-    fn test_with_custom_store() {
-        let custom_store: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::new());
-        let mgr = WebSessionManager::with_store(
-            OidcClient::new(),
-            custom_store,
-            "https://idm.example.com".to_string(),
-            "client".to_string(),
-            None,
-            "openid".to_string(),
-        );
+    fn test_idle_timeout_evicts_session() {
+        let mgr = make_test_mgr().with_idle_timeout(0); // 0s = immediate timeout
 
         let rt = tokio::runtime::Runtime::new().unwrap();
 
-        let token_response = TokenResponse {
-            access_token: "custom-store-token".to_string(),
-            token_type: "Bearer".to_string(),
-            expires_in: Some(900),
-            refresh_token: None,
-            id_token: None,
-            scope: None,
-        };
+        let session_id = rt
+            .block_on(mgr.create_session(&make_token_response("will-expire", None)))
+            .unwrap();
 
-        let session_id = rt.block_on(mgr.create_session(&token_response)).unwrap();
+        // Sleep 1s so Instant::now() advances past idle_timeout=0
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let result = rt.block_on(mgr.get_token(&session_id));
+        assert!(matches!(result, Err(PepError::AuthenticationRequired)));
+    }
+
+    #[test]
+    fn test_idle_timeout_does_not_evict_active_session() {
+        let mgr = make_test_mgr().with_idle_timeout(3600); // 1 hour
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let session_id = rt
+            .block_on(mgr.create_session(&make_token_response("active", None)))
+            .unwrap();
+
+        // Access immediately — should work
         let token = rt.block_on(mgr.get_token(&session_id)).unwrap();
-        assert_eq!(token, "custom-store-token");
+        assert_eq!(token, "active");
+
+        // Access again — should still work (last_accessed updated)
+        let token = rt.block_on(mgr.get_token(&session_id)).unwrap();
+        assert_eq!(token, "active");
+    }
+
+    #[test]
+    fn test_sweep_removes_idle_sessions() {
+        let mgr = make_test_mgr()
+            .with_idle_timeout(0)        // immediate timeout
+            .with_sweep_threshold(2);    // sweep when > 2 sessions
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // Create 3 sessions
+        let id1 = rt.block_on(mgr.create_session(&make_token_response("a", None))).unwrap();
+        let id2 = rt.block_on(mgr.create_session(&make_token_response("b", None))).unwrap();
+        let id3 = rt.block_on(mgr.create_session(&make_token_response("c", None))).unwrap();
+
+        assert_eq!(mgr.session_count(), 3);
+
+        // Sleep so idle timeout (0s) kicks in
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // This get_token triggers sweep (count 3 > threshold 2)
+        // All sessions are idle (0s timeout), so they get swept.
+        // The session we're looking up gets swept too → AuthenticationRequired
+        let result = rt.block_on(mgr.get_token(&id1));
+        assert!(matches!(result, Err(PepError::AuthenticationRequired)));
+        assert_eq!(mgr.session_count(), 0);
+
+        // Suppress unused
+        let _ = (id2, id3);
+    }
+
+    #[test]
+    fn test_sweep_preserves_active_sessions() {
+        let mgr = make_test_mgr()
+            .with_idle_timeout(3600)     // 1 hour — nothing times out
+            .with_sweep_threshold(2);    // sweep when > 2 sessions
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // Create 3 sessions
+        let id1 = rt.block_on(mgr.create_session(&make_token_response("a", None))).unwrap();
+        let _id2 = rt.block_on(mgr.create_session(&make_token_response("b", None))).unwrap();
+        let _id3 = rt.block_on(mgr.create_session(&make_token_response("c", None))).unwrap();
+
+        assert_eq!(mgr.session_count(), 3);
+
+        // Access id1 — triggers sweep, but nothing is idle (1h timeout)
+        let token = rt.block_on(mgr.get_token(&id1)).unwrap();
+        assert_eq!(token, "a");
+        assert_eq!(mgr.session_count(), 3); // nothing swept
+    }
+
+    #[test]
+    fn test_session_count() {
+        let mgr = make_test_mgr();
+        assert_eq!(mgr.session_count(), 0);
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _ = rt.block_on(mgr.create_session(&make_token_response("a", None))).unwrap();
+        let _ = rt.block_on(mgr.create_session(&make_token_response("b", None))).unwrap();
+        assert_eq!(mgr.session_count(), 2);
+
+        mgr.destroy_session(&rt.block_on(mgr.create_session(&make_token_response("c", None))).unwrap()).unwrap();
+        // We created 3, destroyed 1 → 2 remaining
+        // Actually the third create adds one more before we destroy it
+        assert_eq!(mgr.session_count(), 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // WebSessionManager — misc
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_session_manager_debug() {
+        let mgr = make_test_mgr();
+        let debug_str = format!("{:?}", mgr);
+        assert!(debug_str.contains("WebSessionManager"));
+        assert!(debug_str.contains("pdt-api"));
+        assert!(debug_str.contains("idle_timeout_secs"));
     }
 
     #[test]
     fn test_get_token_near_expiry_no_refresh() {
         // Token that is within the refresh buffer but not yet fully expired
         // and has no refresh token should still return the access token
-        // (it hasn't expired yet, just close)
-        let mgr = WebSessionManager::new(
-            OidcClient::new(),
-            "https://idm.example.com".to_string(),
-            "client".to_string(),
-            None,
-            "openid".to_string(),
-        );
+        let mgr = make_test_mgr();
 
-        // Calculate expires_at as now+30 seconds (within 60s buffer)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let near_expiry = now + 30; // 30 seconds from now, within 60s buffer
-
-        let expires_str = format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            1970 + (near_expiry / 31556952) as u32, // rough year
-            1, 1, 0, 0, 0
-        );
-
-        // Just test that token with remaining time > 0 works even without refresh
         let stored = StoredToken::new(
             "still-valid",
             None,
@@ -645,13 +746,37 @@ mod tests {
             "2099-01-01T00:00:00Z",
             None,
         );
-        mgr.store.save("valid-session", &stored).unwrap();
+        {
+            let mut sessions = mgr.sessions.write().unwrap();
+            sessions.insert(
+                "valid-session".to_string(),
+                SessionEntry {
+                    token: stored,
+                    last_accessed: Instant::now(),
+                },
+            );
+        }
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let token = rt.block_on(mgr.get_token("valid-session")).unwrap();
         assert_eq!(token, "still-valid");
+    }
 
-        // Suppress unused variable warning
-        let _ = (expires_str, near_expiry);
+    #[test]
+    fn test_with_idle_timeout_builder() {
+        let mgr = make_test_mgr().with_idle_timeout(7200);
+        assert_eq!(mgr.idle_timeout_secs, 7200);
+    }
+
+    #[test]
+    fn test_with_sweep_threshold_builder() {
+        let mgr = make_test_mgr().with_sweep_threshold(128);
+        assert_eq!(mgr.sweep_threshold, 128);
+    }
+
+    #[test]
+    fn test_with_refresh_buffer_builder() {
+        let mgr = make_test_mgr().with_refresh_buffer(120);
+        assert_eq!(mgr.refresh_buffer_secs, 120);
     }
 }

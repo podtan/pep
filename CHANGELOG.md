@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.3 — 2026-07-22
+
+### Added
+
+- `WebSessionManager` now tracks `last_accessed` per session for idle-timeout
+  eviction. Sessions idle for longer than `idle_timeout_secs` (default: 1 hour)
+  are automatically swept.
+- Amortized idle-session sweep: when session count exceeds `sweep_threshold`
+  (default: 64), `get_token()` triggers a cleanup pass that evicts all idle-
+  expired entries. No background task needed.
+- Builder methods: `with_idle_timeout(secs)`, `with_sweep_threshold(n)`.
+- `WebSessionManager::session_count()` — returns current active session count.
+
+### Changed
+
+- `WebSessionManager` no longer uses the `TokenStore` trait internally — it
+  has its own `HashMap<String, SessionEntry>` with access-time tracking.
+  `InMemoryTokenStore` is kept for `TokenStore` trait compatibility (e.g.
+  `InteractiveTokenProvider`).
+- `with_store()` constructor removed — session lifecycle is self-contained.
+- Cookie max-age should be set by callers to match `idle_timeout_secs`, not
+  the refresh token lifetime.
+
 ## 0.4.2 — 2026-07-06
 
 ### Added
