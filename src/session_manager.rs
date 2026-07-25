@@ -32,6 +32,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use tokio::sync::Mutex;
 use tracing;
 
 use crate::error::{PepError, Result};
@@ -137,6 +138,11 @@ impl crate::token_store::TokenStore for InMemoryTokenStore {
 pub struct WebSessionManager {
     /// Internal session map with access-time tracking.
     sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
+    /// Per-session async mutexes to serialize concurrent refresh attempts.
+    /// When multiple requests for the same session need a refresh at the same
+    /// time, only the first one performs the OIDC refresh; others wait on this
+    /// lock and then read the already-refreshed token from the session store.
+    refresh_locks: Arc<RwLock<HashMap<String, Arc<Mutex<()>>>>>,
     /// OIDC client for token refresh.
     oidc_client: OidcClient,
     /// Issuer URL (e.g. `https://idm.example.com/oauth2/openid/pdt-api`).
@@ -190,6 +196,7 @@ impl WebSessionManager {
     ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            refresh_locks: Arc::new(RwLock::new(HashMap::new())),
             oidc_client,
             issuer_url,
             client_id,
@@ -337,8 +344,54 @@ impl WebSessionManager {
             "Token near expiry, attempting refresh"
         );
 
-        // 3. Need to refresh
+        // 3. Acquire per-session refresh lock to serialize concurrent refreshes.
+        //    If another request already refreshed the token while we waited,
+        //    re-read from the store and return the fresh token.
+        let lock = self.get_refresh_lock(session_id);
+        let _guard = lock.lock().await;
+
+        // Re-check: another request may have already refreshed while we waited
+        if !force_refresh {
+            if let Some(token) = self.try_cached_token(session_id)? {
+                return Ok(token);
+            }
+        }
+
+        // 4. Still need to refresh
         self.refresh_session(session_id, &stored).await
+    }
+
+    /// Get or create the per-session refresh mutex.
+    fn get_refresh_lock(&self, session_id: &str) -> Arc<Mutex<()>> {
+        // Fast path: read lock
+        if let Some(lock) = self.refresh_locks.read().unwrap().get(session_id) {
+            return lock.clone();
+        }
+        // Slow path: write lock to insert
+        let mut locks = self.refresh_locks.write().unwrap();
+        locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Check if the session's token has been refreshed by another request
+    /// since we last checked. Returns `Ok(Some(token))` if the token is now
+    /// valid (another request refreshed it), `Ok(None)` if still needs refresh.
+    fn try_cached_token(&self, session_id: &str) -> Result<Option<String>> {
+        let sessions = self.sessions.read().unwrap();
+        if let Some(entry) = sessions.get(session_id) {
+            let remaining = seconds_until_expiry(&entry.token.expires_at);
+            if remaining > self.refresh_buffer_secs {
+                tracing::debug!(
+                    session_id = %session_id,
+                    remaining_secs = remaining,
+                    "Token already refreshed by concurrent request"
+                );
+                return Ok(Some(entry.token.access_token.clone()));
+            }
+        }
+        Ok(None)
     }
 
     /// Destroy a session, removing it from the store.
@@ -791,5 +844,17 @@ mod tests {
     fn test_with_refresh_buffer_builder() {
         let mgr = make_test_mgr().with_refresh_buffer(120);
         assert_eq!(mgr.refresh_buffer_secs, 120);
+    }
+
+    #[test]
+    fn test_refresh_lock_returns_same_arc() {
+        // Verify that get_refresh_lock returns the same Arc for the same session_id.
+        // This is the mechanism that prevents concurrent refresh races.
+        let mgr = make_test_mgr();
+        let lock1 = mgr.get_refresh_lock("session-a");
+        let lock2 = mgr.get_refresh_lock("session-a");
+        let lock3 = mgr.get_refresh_lock("session-b");
+        assert!(Arc::ptr_eq(&lock1, &lock2));
+        assert!(!Arc::ptr_eq(&lock1, &lock3));
     }
 }
