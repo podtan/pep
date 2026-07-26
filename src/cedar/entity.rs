@@ -88,12 +88,31 @@ pub fn build_principal_entity(claims: &JwtClaims) -> Result<Entity, CedarError> 
         );
     }
 
-    // Add roles as a set if present in extra claims
-    if let Some(serde_json::Value::Array(roles)) = claims.extra.get("roles") {
-        let set_exprs: Vec<RestrictedExpression> = roles
+    // Add `role` (singular) — handles both string and array formats from different IdPs.
+    //
+    // Kanidm's userinfo endpoint returns `role` as a JSON array (e.g. `["admin"]`)
+    // because claim maps can map multiple groups to multiple role values.
+    // Some IdPs (e.g. Auth0) return a single string instead.
+    if let Some(role) = claims.extra.get("role") {
+        let role_str = match role {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .next(),
+            _ => None,
+        };
+        if let Some(role_str) = role_str {
+            attrs.insert("role".to_string(), RestrictedExpression::new_string(role_str));
+        }
+    }
+
+    // Add `groups` as a set if present in extra claims
+    if let Some(serde_json::Value::Array(groups)) = claims.extra.get("groups") {
+        let set_exprs: Vec<RestrictedExpression> = groups
             .iter()
-            .filter_map(|r| {
-                if let serde_json::Value::String(s) = r {
+            .filter_map(|g| {
+                if let serde_json::Value::String(s) = g {
                     Some(RestrictedExpression::new_string(s.clone()))
                 } else {
                     None
@@ -101,7 +120,7 @@ pub fn build_principal_entity(claims: &JwtClaims) -> Result<Entity, CedarError> 
             })
             .collect();
         if !set_exprs.is_empty() {
-            attrs.insert("roles".to_string(), RestrictedExpression::new_set(set_exprs));
+            attrs.insert("groups".to_string(), RestrictedExpression::new_set(set_exprs));
         }
     }
 
