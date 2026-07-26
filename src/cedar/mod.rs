@@ -5,6 +5,8 @@
 //!
 //! - **`CedarAuthorizer`**: Loads Cedar policies and evaluates authorization requests
 //! - **`CedarConfig`**: TOML-based configuration for policy paths and settings
+//! - **`PolicyStoreClient`**: Fetches policies from a remote HTTP endpoint
+//! - **`PolicyStoreResponse`**: Wire format for the policy store API
 //! - **`SchemaLoader`**: Loads Cedar schemas from `.cedarschema` files
 //! - **Entity building**: Converts `JwtClaims` and resource metadata into Cedar entities
 //!
@@ -15,40 +17,39 @@
 //!           "Who are you?"          "Can you do this?"        "Here's the data"
 //! ```
 //!
-//! Each service defines its **own** schema in a `.cedarschema` file — PEP does not
-//! bake any domain-specific entity types into the library.
+//! # Policy Sources
 //!
-//! # Example
+//! `CedarAuthorizer` supports three policy sources, tried in priority order:
+//!
+//! 1. **Policy store URL** — fetched from a remote HTTP endpoint (e.g. PDT `/api/cedar/policies`)
+//! 2. **Filesystem** — loaded from `policy_path` on disk
+//! 3. **Embedded** — compiled into the binary via `include_str!` as a default
+//!
+//! # Example: Embedded defaults with remote policy store
 //!
 //! ```rust,ignore
-//! use pep::cedar::{CedarAuthorizer, CedarConfig, ResourceInfo, build_principal_uid, build_action_uid};
-//! use pep::oidc::types::JwtClaims;
-//! use cedar_policy::{Request, Context};
+//! use pep::cedar::{CedarAuthorizer, CedarConfig};
 //!
 //! let config = CedarConfig {
-//!     policy_path: "./policies".into(),
-//!     schema_path: Some("./policies/schema.cedarschema".into()),
+//!     policy_path: "./policies".into(),  // filesystem fallback
+//!     embedded_policy: Some(include_str!("../policies/rbac.cedar")),
+//!     embedded_schema: Some(include_str!("../policies/schema.cedarschema")),
+//!     policy_store_url: Some("http://localhost:8080/api/cedar/policies".into()),
 //!     ..Default::default()
 //! };
-//! let authorizer = CedarAuthorizer::new(config)?;
-//!
-//! let principal = build_principal_uid(&claims)?;
-//! let action = build_action_uid("view")?;
-//! let resource = ResourceInfo::new("Task", "task-123").to_cedar_uid()?;
-//!
-//! let request = Request::new(principal, action, resource, Context::empty(), None)?;
-//! let response = authorizer.is_allowed(&request);
-//! assert!(response.allowed());
+//! let authorizer = CedarAuthorizer::new_with_policy_store(config).await?;
 //! ```
 
 pub mod authorizer;
 pub mod config;
 pub mod entity;
 pub mod error;
+pub mod policy_store;
 pub mod schema;
 
 pub use authorizer::CedarAuthorizer;
-pub use config::CedarConfig;
+pub use config::{CedarConfig, DefaultDecision};
 pub use entity::{ResourceInfo, build_principal_uid, build_principal_entity, build_action_uid};
 pub use error::CedarError;
+pub use policy_store::{PolicyStoreClient, PolicyStoreResponse};
 pub use schema::{load_schema, parse_schema, validate_policies};

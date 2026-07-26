@@ -104,7 +104,7 @@ pub mod cedar;
 
 // Re-export cedar types when feature is enabled
 #[cfg(feature = "cedar")]
-pub use cedar::{CedarAuthorizer, CedarConfig, CedarError};
+pub use cedar::{CedarAuthorizer, CedarConfig, CedarError, DefaultDecision, PolicyStoreClient, PolicyStoreResponse};
 
 // Token provider module for client-side token lifecycle management
 #[cfg(feature = "token-provider")]
