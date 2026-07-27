@@ -138,6 +138,96 @@ pub trait TokenStore: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// MemoryTokenStore
+// ---------------------------------------------------------------------------
+
+/// In-memory token store backed by an `Arc<RwLock<HashMap>>`.
+///
+/// Designed for multi-user scenarios (e.g., TMU — Trustee Multi-User) where
+/// each user gets an isolated token store that lives in process memory and
+/// is lost on restart. Because it uses `Arc<RwLock<...>>` internally, cloning
+/// a `MemoryTokenStore` creates another handle to the **same** underlying map
+/// — so it can be shared across async tasks and passed by clone.
+///
+/// # Use Cases
+///
+/// - **Per-user token isolation**: Each user session gets its own
+///   `MemoryTokenStore` instance. Tokens for one user are invisible to
+///   another, unlike `FileTokenStore` where all tokens share
+///   `~/.{agent_name}/tokens/`.
+/// - **Testing**: No filesystem cleanup needed; tokens vanish on drop.
+/// - **Short-lived processes**: No persistence needed.
+///
+/// # Example
+///
+/// ```
+/// use pep::token_store::{TokenStore, MemoryTokenStore, StoredToken};
+///
+/// let store = MemoryTokenStore::new();
+/// let token = StoredToken::new("access123", Some("refresh456".to_string()),
+///     "Bearer", "2099-01-01T00:00:00Z", None);
+///
+/// store.save("my-mcp-server", &token).unwrap();
+/// let loaded = store.load("my-mcp-server").unwrap().unwrap();
+/// assert_eq!(loaded.access_token, "access123");
+/// ```
+///
+/// # Clone Semantics
+///
+/// Cloning a `MemoryTokenStore` does **not** copy the data — it creates
+/// another reference to the same shared map:
+///
+/// ```
+/// use pep::token_store::{TokenStore, MemoryTokenStore, StoredToken};
+///
+/// let store_a = MemoryTokenStore::new();
+/// let store_b = store_a.clone(); // shares the same underlying map
+///
+/// store_a.save("key", &StoredToken::new("tok", None, "Bearer", "2099-01-01T00:00:00Z", None)).unwrap();
+/// assert!(store_b.load("key").unwrap().is_some()); // visible from clone
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct MemoryTokenStore {
+    tokens: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, StoredToken>>>,
+}
+
+impl MemoryTokenStore {
+    /// Create a new empty in-memory token store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the number of stored tokens.
+    pub fn len(&self) -> usize {
+        self.tokens.read().unwrap().len()
+    }
+
+    /// Returns `true` if no tokens are stored.
+    pub fn is_empty(&self) -> bool {
+        self.tokens.read().unwrap().is_empty()
+    }
+}
+
+impl TokenStore for MemoryTokenStore {
+    fn load(&self, name: &str) -> Result<Option<StoredToken>> {
+        let tokens = self.tokens.read().unwrap();
+        Ok(tokens.get(name).cloned())
+    }
+
+    fn save(&self, name: &str, token: &StoredToken) -> Result<()> {
+        let mut tokens = self.tokens.write().unwrap();
+        tokens.insert(name.to_string(), token.clone());
+        Ok(())
+    }
+
+    fn delete(&self, name: &str) -> Result<()> {
+        let mut tokens = self.tokens.write().unwrap();
+        tokens.remove(name);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // FileTokenStore
 // ---------------------------------------------------------------------------
 
@@ -388,5 +478,98 @@ mod tests {
         assert_eq!(parse_rfc3339_to_epoch("1970-01-02T00:00:00Z"), Some(86400));
         // Invalid input
         assert_eq!(parse_rfc3339_to_epoch("garbage"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // MemoryTokenStore tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_memory_store_round_trip() {
+        let store = MemoryTokenStore::new();
+        let token = StoredToken::new(
+            "access123",
+            Some("refresh456".to_string()),
+            "Bearer",
+            "2099-01-01T00:00:00Z",
+            Some("openid profile".to_string()),
+        );
+
+        store.save("session1", &token).unwrap();
+        let loaded = store.load("session1").unwrap().expect("should exist");
+        assert_eq!(loaded.access_token, "access123");
+        assert_eq!(loaded.refresh_token.as_deref(), Some("refresh456"));
+    }
+
+    #[test]
+    fn test_memory_store_delete() {
+        let store = MemoryTokenStore::new();
+        let token = StoredToken::new("a", None, "Bearer", "2099-01-01T00:00:00Z", None);
+        store.save("temp", &token).unwrap();
+        assert!(store.load("temp").unwrap().is_some());
+        store.delete("temp").unwrap();
+        assert!(store.load("temp").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_memory_store_load_nonexistent() {
+        let store = MemoryTokenStore::new();
+        assert!(store.load("ghost").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_memory_store_overwrite() {
+        let store = MemoryTokenStore::new();
+        let token1 = StoredToken::new("first", None, "Bearer", "2099-01-01T00:00:00Z", None);
+        store.save("key", &token1).unwrap();
+
+        let token2 = StoredToken::new("second", None, "Bearer", "2099-01-01T00:00:00Z", None);
+        store.save("key", &token2).unwrap();
+
+        let loaded = store.load("key").unwrap().unwrap();
+        assert_eq!(loaded.access_token, "second");
+    }
+
+    #[test]
+    fn test_memory_store_clone_shares_data() {
+        let store_a = MemoryTokenStore::new();
+        let store_b = store_a.clone();
+
+        let token = StoredToken::new("shared", None, "Bearer", "2099-01-01T00:00:00Z", None);
+        store_a.save("key", &token).unwrap();
+
+        // store_b should see the token written by store_a
+        let loaded = store_b.load("key").unwrap().unwrap();
+        assert_eq!(loaded.access_token, "shared");
+
+        // Delete from store_b → gone from store_a too
+        store_b.delete("key").unwrap();
+        assert!(store_a.load("key").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_memory_store_len_and_is_empty() {
+        let store = MemoryTokenStore::new();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+
+        let token = StoredToken::new("a", None, "Bearer", "2099-01-01T00:00:00Z", None);
+        store.save("one", &token).unwrap();
+        store.save("two", &token).unwrap();
+        assert_eq!(store.len(), 2);
+        assert!(!store.is_empty());
+    }
+
+    #[test]
+    fn test_memory_store_isolation() {
+        // Two independent stores should not share data
+        let store_a = MemoryTokenStore::new();
+        let store_b = MemoryTokenStore::new();
+
+        let token = StoredToken::new("secret", None, "Bearer", "2099-01-01T00:00:00Z", None);
+        store_a.save("cred", &token).unwrap();
+
+        assert!(store_a.load("cred").unwrap().is_some());
+        assert!(store_b.load("cred").unwrap().is_none());
     }
 }

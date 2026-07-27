@@ -128,7 +128,7 @@ pub use token_provider::{
 
 // Re-export token store types
 #[cfg(feature = "token-provider")]
-pub use token_store::{TokenStore, FileTokenStore, StoredToken};
+pub use token_store::{TokenStore, FileTokenStore, MemoryTokenStore, StoredToken};
 
 // Web session manager module (server-side session token management)
 #[cfg(feature = "token-provider")]
