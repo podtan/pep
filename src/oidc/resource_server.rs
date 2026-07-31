@@ -346,6 +346,10 @@ impl ResourceServerClient {
 
         // Set up validation
         let mut validation = Validation::new(algorithm);
+        // Allow 60 seconds of clock skew between issuer, proxy, and resource server.
+        // Without this, sub-second timing differences between Torpi (proxy) and
+        // Trustee (resource server) can cause ExpiredSignature on valid tokens.
+        validation.leeway = 60;
 
         // Configure issuer validation
         if options.skip_issuer_validation {

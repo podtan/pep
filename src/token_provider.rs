@@ -415,8 +415,56 @@ pub(crate) fn compute_expires_at(expires_in: Option<u64>) -> String {
     epoch_to_rfc3339(expires_epoch)
 }
 
+/// Compute expiry from the actual JWT `exp` claim.
+///
+/// Decodes the JWT payload (without signature verification — we only need
+/// the `exp` field) and returns an RFC-3339 timestamp. Falls back to
+/// `compute_expires_at(expires_in)` if the JWT cannot be decoded.
+///
+/// This is more accurate than using `expires_in` from the token response
+/// because it accounts for the time between the IdP minting the token
+/// and the response reaching us.
+pub(crate) fn compute_expires_at_from_jwt(
+    access_token: &str,
+    expires_in_fallback: Option<u64>,
+) -> String {
+    // JWT structure: header.payload.signature — we only need the payload
+    let parts: Vec<&str> = access_token.split('.').collect();
+    if parts.len() < 2 {
+        return compute_expires_at(expires_in_fallback);
+    }
+
+    use base64::Engine;
+    let payload = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // Try standard base64 as fallback
+            match base64::engine::general_purpose::STANDARD_NO_PAD.decode(parts[1]) {
+                Ok(bytes) => bytes,
+                Err(_) => return compute_expires_at(expires_in_fallback),
+            }
+        }
+    };
+
+    let payload_json: serde_json::Value = match serde_json::from_slice(&payload) {
+        Ok(v) => v,
+        Err(_) => return compute_expires_at(expires_in_fallback),
+    };
+
+    if let Some(exp) = payload_json.get("exp").and_then(|v| v.as_u64()) {
+        tracing::debug!(
+            jwt_exp = exp,
+            "Extracted real exp from JWT payload for expiry tracking"
+        );
+        epoch_to_rfc3339(exp)
+    } else {
+        tracing::debug!("No exp claim in JWT, falling back to expires_in estimate");
+        compute_expires_at(expires_in_fallback)
+    }
+}
+
 /// Convert epoch seconds to an RFC-3339 UTC timestamp.
-fn epoch_to_rfc3339(epoch: u64) -> String {
+pub(crate) fn epoch_to_rfc3339(epoch: u64) -> String {
     let days = epoch / 86400;
     let remainder = epoch % 86400;
     let hour = remainder / 3600;

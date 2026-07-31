@@ -37,7 +37,7 @@ use tracing;
 
 use crate::error::{PepError, Result};
 use crate::oidc_client::{OidcClient, TokenResponse};
-use crate::token_provider::{compute_expires_at, seconds_until_expiry};
+use crate::token_provider::{compute_expires_at_from_jwt, seconds_until_expiry};
 use crate::token_store::StoredToken;
 
 // ---------------------------------------------------------------------------
@@ -244,7 +244,8 @@ impl WebSessionManager {
     pub async fn create_session(&self, token_response: &TokenResponse) -> Result<String> {
         let session_id = uuid::Uuid::new_v4().to_string();
 
-        let expires_at = compute_expires_at(token_response.expires_in);
+        let expires_at =
+            compute_expires_at_from_jwt(&token_response.access_token, token_response.expires_in);
 
         let stored = StoredToken::new(
             &token_response.access_token,
@@ -438,7 +439,10 @@ impl WebSessionManager {
 
         match response {
             Ok(token_response) => {
-                let new_expires_at = compute_expires_at(token_response.expires_in);
+                let new_expires_at = compute_expires_at_from_jwt(
+                    &token_response.access_token,
+                    token_response.expires_in,
+                );
 
                 let updated = StoredToken::new(
                     &token_response.access_token,
