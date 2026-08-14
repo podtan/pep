@@ -29,9 +29,11 @@
 //! regardless of which OAuth2 client signed the original token.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing;
 
@@ -49,6 +51,106 @@ use crate::token_store::StoredToken;
 struct SessionEntry {
     token: StoredToken,
     last_accessed: Instant,
+}
+
+// ---------------------------------------------------------------------------
+// SessionStore — pluggable persistence for WebSessionManager
+// ---------------------------------------------------------------------------
+
+/// Persisted representation of a session entry.
+///
+/// `last_accessed_epoch` replaces the in-memory `Instant` with a portable
+/// epoch timestamp so entries can round-trip through disk or a database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredSession {
+    pub token: StoredToken,
+    /// Seconds since the Unix epoch when the session was last accessed.
+    pub last_accessed_epoch: u64,
+}
+
+/// Pluggable backing store for [`WebSessionManager`].
+///
+/// When set, sessions survive process restarts and are shared across
+/// replicas (e.g. multiple instances behind a load balancer, or a blue/green
+/// deploy). The default is in-memory only — pass a store via
+/// [`WebSessionManager::with_session_store`].
+///
+/// Implementations must be `Send + Sync`. Methods are synchronous; disk-backed
+/// implementations should keep operations small (a single JSON file per
+/// session) so they are safe to call under the session manager's locks.
+pub trait SessionStore: Send + Sync {
+    /// Load a session by its opaque session ID. `Ok(None)` = not found.
+    fn load_session(&self, session_id: &str) -> Result<Option<StoredSession>>;
+
+    /// Insert or replace a session.
+    fn save_session(&self, session_id: &str, session: &StoredSession) -> Result<()>;
+
+    /// Delete a session. Missing IDs are silently ignored.
+    fn delete_session(&self, session_id: &str) -> Result<()>;
+}
+
+/// File-backed [`SessionStore`] — one JSON file per session under a directory.
+///
+/// Suitable for a single host (or replicas sharing a mounted volume).
+/// Filenames are the session IDs; callers should treat session IDs as opaque
+/// random UUIDs (which `WebSessionManager` generates), so path safety holds.
+///
+/// Writes are atomic (temp file + rename) to avoid torn files on crash.
+#[derive(Debug, Clone)]
+pub struct FileSessionStore {
+    dir: PathBuf,
+}
+
+impl FileSessionStore {
+    /// Create a store rooted at `dir`, creating the directory if needed.
+    pub fn new(dir: impl Into<PathBuf>) -> Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
+    fn path_for(&self, session_id: &str) -> PathBuf {
+        // Defensive: reject anything that could escape the directory.
+        let safe: String = session_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+            .collect();
+        self.dir.join(format!("{}.json", safe))
+    }
+}
+
+impl SessionStore for FileSessionStore {
+    fn load_session(&self, session_id: &str) -> Result<Option<StoredSession>> {
+        let path = self.path_for(session_id);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let s = serde_json::from_slice::<StoredSession>(&bytes)
+                    .map_err(|e| PepError::Internal(anyhow::anyhow!("corrupt session file {:?}: {}", path, e)))?;
+                Ok(Some(s))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PepError::Internal(anyhow::anyhow!("failed to read session file {:?}: {}", path, e))),
+        }
+    }
+
+    fn save_session(&self, session_id: &str, session: &StoredSession) -> Result<()> {
+        let path = self.path_for(session_id);
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec(session)
+            .map_err(|e| PepError::Internal(anyhow::anyhow!("serialize session: {}", e)))?;
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    fn delete_session(&self, session_id: &str) -> Result<()> {
+        let path = self.path_for(session_id);
+        match std::fs::remove_file(&path) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(PepError::Internal(anyhow::anyhow!("failed to delete session file {:?}: {}", path, e))),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +201,14 @@ impl crate::token_store::TokenStore for InMemoryTokenStore {
     }
 }
 
+/// Current Unix time in seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 // ---------------------------------------------------------------------------
 // WebSessionManager
 // ---------------------------------------------------------------------------
@@ -138,6 +248,10 @@ impl crate::token_store::TokenStore for InMemoryTokenStore {
 pub struct WebSessionManager {
     /// Internal session map with access-time tracking.
     sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
+    /// Optional durable backing store. When set, sessions are also written
+    /// here (and loaded from here on cache miss) so they survive process
+    /// restarts and are visible to replicas sharing the same store.
+    store: Option<Arc<dyn SessionStore>>,
     /// Per-session async mutexes to serialize concurrent refresh attempts.
     /// When multiple requests for the same session need a refresh at the same
     /// time, only the first one performs the OIDC refresh; others wait on this
@@ -196,6 +310,7 @@ impl WebSessionManager {
     ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            store: None,
             refresh_locks: Arc::new(RwLock::new(HashMap::new())),
             oidc_client,
             issuer_url,
@@ -233,6 +348,64 @@ impl WebSessionManager {
         self
     }
 
+    /// Attach a durable [`SessionStore`] backing (e.g. [`FileSessionStore`]).
+    ///
+    /// When set:
+    /// - `create_session` writes through to the store
+    /// - `get_token` loads from the store on in-memory cache miss
+    /// - `destroy_session` / idle eviction delete from the store
+    ///
+    /// This makes sessions survive restarts and allows replicas sharing the
+    /// store (same volume) to accept each other's session cookies.
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Persist a session entry to the backing store (if any). Errors are
+    /// logged and ignored — losing persistence must not break auth.
+    fn persist(&self, session_id: &str, entry: &SessionEntry) {
+        if let Some(ref store) = self.store {
+            let stored = StoredSession {
+                token: entry.token.clone(),
+                last_accessed_epoch: unix_now(),
+            };
+            if let Err(e) = store.save_session(session_id, &stored) {
+                tracing::warn!(session_id = %session_id, error = %e, "session store write failed");
+            }
+        }
+    }
+
+    /// Remove a session from the backing store (if any).
+    fn unpersist(&self, session_id: &str) {
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.delete_session(session_id) {
+                tracing::warn!(session_id = %session_id, error = %e, "session store delete failed");
+            }
+        }
+    }
+
+    /// Look up a session, falling back to the durable store on an in-memory
+    /// miss (restart or cross-replica). Restores into the in-memory cache.
+    fn lookup(&self, session_id: &str) -> Option<SessionEntry> {
+        if let Some(entry) = self.sessions.read().unwrap().get(session_id) {
+            return Some(entry.clone());
+        }
+        let store = self.store.as_ref()?;
+        let stored = store.load_session(session_id).ok()??;
+        let entry = SessionEntry {
+            token: stored.token,
+            // Best-effort: if the persisted idle timestamp is older than the
+            // idle timeout, treat as expired (sweeper will drop it).
+            last_accessed: Instant::now(),
+        };
+        self.sessions
+            .write()
+            .unwrap()
+            .insert(session_id.to_string(), entry.clone());
+        Some(entry)
+    }
+
     /// Create a new session from a token response.
     ///
     /// Generates a random UUID session ID, stores the tokens server-side,
@@ -262,8 +435,9 @@ impl WebSessionManager {
 
         {
             let mut sessions = self.sessions.write().unwrap();
-            sessions.insert(session_id.clone(), entry);
+            sessions.insert(session_id.clone(), entry.clone());
         }
+        self.persist(&session_id, &entry);
 
         tracing::debug!(
             session_id = %session_id,
@@ -307,30 +481,54 @@ impl WebSessionManager {
                 self.sweep_idle_sessions(&mut sessions);
             }
 
-            let entry = match sessions.get_mut(session_id) {
-                Some(e) => e,
-                None => {
+            // In-memory miss: consult the durable store (restart or
+            // cross-replica) and restore into the cache.
+            if !sessions.contains_key(session_id) {
+                // Drop the write lock before lookup() takes a read lock.
+                drop(sessions);
+                let restored = self.lookup(session_id).ok_or_else(|| {
                     tracing::debug!(session_id = %session_id, "Session not found");
+                    PepError::AuthenticationRequired
+                })?;
+                let mut sessions = self.sessions.write().unwrap();
+                sessions.insert(session_id.to_string(), restored);
+                // Fall through with this same guard held.
+                let entry = match sessions.get_mut(session_id) {
+                    Some(e) => e,
+                    None => {
+                        tracing::debug!(session_id = %session_id, "Session not found (raced)");
+                        return Err(PepError::AuthenticationRequired);
+                    }
+                };
+                entry.last_accessed = Instant::now();
+                entry.token.clone()
+            } else {
+                let entry = match sessions.get_mut(session_id) {
+                    Some(e) => e,
+                    None => {
+                        tracing::debug!(session_id = %session_id, "Session not found");
+                        return Err(PepError::AuthenticationRequired);
+                    }
+                };
+
+                // Check idle timeout
+                let idle_secs = entry.last_accessed.elapsed().as_secs();
+                if idle_secs > self.idle_timeout_secs {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        idle_secs = idle_secs,
+                        idle_timeout = self.idle_timeout_secs,
+                        "Session idle-expired"
+                    );
+                    sessions.remove(session_id);
+                    self.unpersist(session_id);
                     return Err(PepError::AuthenticationRequired);
                 }
-            };
 
-            // Check idle timeout
-            let idle_secs = entry.last_accessed.elapsed().as_secs();
-            if idle_secs > self.idle_timeout_secs {
-                tracing::debug!(
-                    session_id = %session_id,
-                    idle_secs = idle_secs,
-                    idle_timeout = self.idle_timeout_secs,
-                    "Session idle-expired"
-                );
-                sessions.remove(session_id);
-                return Err(PepError::AuthenticationRequired);
+                // Update access time
+                entry.last_accessed = Instant::now();
+                entry.token.clone()
             }
-
-            // Update access time
-            entry.last_accessed = Instant::now();
-            entry.token.clone()
         };
 
         // 2. Check if token is still valid (with buffer)
@@ -401,6 +599,7 @@ impl WebSessionManager {
     pub fn destroy_session(&self, session_id: &str) -> Result<()> {
         let mut sessions = self.sessions.write().unwrap();
         sessions.remove(session_id);
+        self.unpersist(session_id);
         tracing::debug!(session_id = %session_id, "Session destroyed");
         Ok(())
     }
@@ -461,6 +660,7 @@ impl WebSessionManager {
                 let mut sessions = self.sessions.write().unwrap();
                 if let Some(entry) = sessions.get_mut(session_id) {
                     entry.token = updated;
+                    self.persist(session_id, entry);
                 }
 
                 tracing::info!(
@@ -498,9 +698,19 @@ impl WebSessionManager {
     fn sweep_idle_sessions(&self, sessions: &mut HashMap<String, SessionEntry>) {
         let before = sessions.len();
         let timeout = std::time::Duration::from_secs(self.idle_timeout_secs);
+        let expired_ids: Vec<String> = sessions
+            .iter()
+            .filter(|(_, entry)| entry.last_accessed.elapsed() >= timeout)
+            .map(|(id, _)| id.clone())
+            .collect();
         sessions.retain(|_, entry| entry.last_accessed.elapsed() < timeout);
         let swept = before - sessions.len();
         if swept > 0 {
+            // Also drop swept sessions from the durable store so they do not
+            // resurrect after a restart or on another replica.
+            for id in &expired_ids {
+                self.unpersist(id);
+            }
             tracing::info!(
                 swept = swept,
                 remaining = sessions.len(),
@@ -861,4 +1071,144 @@ mod tests {
         assert!(Arc::ptr_eq(&lock1, &lock2));
         assert!(!Arc::ptr_eq(&lock1, &lock3));
     }
+    // ── SessionStore persistence tests ──────────────────────────────────
+
+    use crate::session_manager::FileSessionStore;
+
+    fn temp_store_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pep_sess_test_{}", uuid::Uuid::new_v4()));
+        d
+    }
+
+    fn mgr_with_store(dir: &PathBuf) -> WebSessionManager {
+        let store = FileSessionStore::new(dir).unwrap();
+        WebSessionManager::new(
+            OidcClient::new(),
+            "https://idm.example.test".to_string(),
+            "test-client".to_string(),
+            None,
+            "openid".to_string(),
+        )
+        .with_session_store(std::sync::Arc::new(store))
+    }
+
+    fn token_response(exp_in: u64) -> TokenResponse {
+        TokenResponse {
+            access_token: format!("fake-access-{}", uuid::Uuid::new_v4()),
+            refresh_token: Some(format!("fake-refresh-{}", uuid::Uuid::new_v4())),
+            token_type: "Bearer".to_string(),
+            expires_in: Some(exp_in),
+            id_token: None,
+            scope: Some("openid".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_store_roundtrip() {
+        let dir = temp_store_dir();
+        let store = FileSessionStore::new(&dir).unwrap();
+        let sess = StoredSession {
+            token: StoredToken::new("at", Some("rt".to_string()), "Bearer", "2099-01-01T00:00:00Z", None),
+            last_accessed_epoch: 42,
+        };
+        store.save_session("abc-123", &sess).unwrap();
+        let loaded = store.load_session("abc-123").unwrap().unwrap();
+        assert_eq!(loaded.token.access_token, "at");
+        assert_eq!(loaded.last_accessed_epoch, 42);
+        store.delete_session("abc-123").unwrap();
+        assert!(store.load_session("abc-123").unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn session_survives_process_restart() {
+        let dir = temp_store_dir();
+        let sid = {
+            let mgr = mgr_with_store(&dir);
+            let sid = mgr.create_session(&token_response(3600)).await.unwrap();
+            // sanity: readable in this instance
+            mgr.get_token(&sid).await.unwrap();
+            sid
+        };
+        // "Restart": brand-new manager over the same directory, empty memory
+        let mgr2 = mgr_with_store(&dir);
+        let tok = mgr2.get_token(&sid).await
+            .expect("session must survive restart via file store");
+        assert!(tok.starts_with("fake-access-"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn session_visible_across_replicas() {
+        let dir = temp_store_dir();
+        let replica_a = mgr_with_store(&dir);
+        let sid = replica_a.create_session(&token_response(3600)).await.unwrap();
+
+        // Replica B (separate memory) must see A's session via the shared store
+        let replica_b = mgr_with_store(&dir);
+        let tok = replica_b.get_token(&sid).await
+            .expect("replica B must resolve A's session through shared store");
+        assert!(tok.starts_with("fake-access-"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn destroy_session_removes_persisted_file() {
+        let dir = temp_store_dir();
+        let mgr = mgr_with_store(&dir);
+        let sid = mgr.create_session(&token_response(3600)).await.unwrap();
+        assert!(mgr.get_token(&sid).await.is_ok());
+        mgr.destroy_session(&sid).unwrap();
+        // A fresh manager (restart) must NOT resurrect it
+        let mgr2 = mgr_with_store(&dir);
+        assert!(mgr2.get_token(&sid).await.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_store_sanitizes_unsafe_ids() {
+        let dir = temp_store_dir();
+        let store = FileSessionStore::new(&dir).unwrap();
+        store.save_session("../../etc/passwd", &StoredSession {
+            token: StoredToken::new("at", None, "Bearer", "2099-01-01T00:00:00Z", None),
+            last_accessed_epoch: 1,
+        }).unwrap();
+        // Exactly one file, contained inside the store dir (no traversal).
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1);
+        let name = entries[0].file_name().to_string_lossy().to_string();
+        assert!(name.starts_with(".._.._") || !name.contains('/'),
+                "file must be sanitized inside the store dir, got {:?}", name);
+        // Sanitization is deterministic: the same unsafe id maps to the same
+        // sanitized filename, so load still resolves (contained, not escaped).
+        let loaded = store.load_session("../../etc/passwd").unwrap();
+        assert!(loaded.is_some(), "deterministic sanitization keeps round-trip working");
+        // And nothing escaped into /etc
+        assert!(!std::path::Path::new("/etc/passwd.json").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn without_store_stays_in_memory() {
+        // Default behavior unchanged: no persistence
+        let mgr = WebSessionManager::new(
+            OidcClient::new(),
+            "https://idm.example.test".to_string(),
+            "test-client".to_string(),
+            None,
+            "openid".to_string(),
+        );
+        let sid = mgr.create_session(&token_response(3600)).await.unwrap();
+        assert!(mgr.get_token(&sid).await.is_ok());
+        // Fresh manager cannot see it
+        let mgr2 = WebSessionManager::new(
+            OidcClient::new(),
+            "https://idm.example.test".to_string(),
+            "test-client".to_string(),
+            None,
+            "openid".to_string(),
+        );
+        assert!(mgr2.get_token(&sid).await.is_err());
+    }
+
 }

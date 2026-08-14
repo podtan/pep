@@ -136,7 +136,7 @@ pub mod session_manager;
 
 // Re-export session manager types
 #[cfg(feature = "token-provider")]
-pub use session_manager::{WebSessionManager, InMemoryTokenStore};
+pub use session_manager::{WebSessionManager, InMemoryTokenStore, SessionStore, FileSessionStore, StoredSession};
 
 // Re-export OAuth callback server types
 #[cfg(feature = "token-provider")]
