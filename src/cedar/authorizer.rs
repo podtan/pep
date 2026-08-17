@@ -299,16 +299,21 @@ impl CedarAuthorizer {
 
     /// Resolve schema from embedded string, filesystem, or none.
     fn resolve_schema_sync(config: &CedarConfig) -> CedarResult<Option<Schema>> {
-        // Try embedded schema first (compiled-in)
-        if let Some(embedded) = config.embedded_schema {
-            return Ok(Some(schema::parse_schema(embedded)?));
-        }
-
-        // Fall back to filesystem
+        // Filesystem first — operators must be able to evolve the schema
+        // (e.g. add entity types) by editing the deployed file, exactly as
+        // they already can with deployed policy files. The embedded schema
+        // is only a fallback for when no schema_path exists on disk.
+        // This mirrors resolve_policies_sync, where files likewise take
+        // precedence over embedded_policies.
         if let Some(ref schema_path) = config.schema_path {
             if schema_path.exists() {
                 return Ok(Some(schema::load_schema(schema_path)?));
             }
+        }
+
+        // Fall back to embedded schema (compiled-in)
+        if let Some(embedded) = config.embedded_schema {
+            return Ok(Some(schema::parse_schema(embedded)?));
         }
 
         Ok(None)
@@ -696,5 +701,107 @@ mod tests {
 
         let result = CedarAuthorizer::new(config);
         assert!(result.is_err());
+    }
+
+    /// Filesystem schema must take precedence over an embedded schema, so
+    /// operators can evolve the deployed schema (e.g. add entity types)
+    /// without rebuilding — mirroring how deployed policy files already
+    /// override embedded policies.
+    #[test]
+    fn test_filesystem_schema_overrides_embedded() {
+        let dir = std::env::temp_dir().join(format!("pep-schema-prio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Embedded schema knows only File; file schema also knows Doc.
+        let embedded_schema = r#"
+            entity User;
+            entity File;
+            action View appliesTo { principal: [User], resource: [File] };
+        "#;
+        // File schema extends the same action to Doc — a policy referencing
+        // Doc validates ONLY against the file schema.
+        let file_schema = r#"
+            entity User;
+            entity File;
+            entity Doc;
+            action View appliesTo { principal: [User], resource: [File, Doc] };
+        "#;
+        // Policy references Doc: with the old order (embedded first) this
+        // failed validation; with files first it must load cleanly.
+        let policy = r#"
+            permit(
+                principal == User::"alice",
+                action == Action::"View",
+                resource == Doc::"d1"
+            );
+        "#;
+
+        let schema_path = dir.join("schema.cedarschema");
+        std::fs::write(&schema_path, file_schema).unwrap();
+
+        let config = CedarConfig {
+            policy_path: dir.join("policies").into(), // nonexistent dir → embedded policy
+            schema_path: Some(schema_path),
+            entities_path: None,
+            default_decision: super::super::config::DefaultDecision::Deny,
+            validate_on_load: true,
+            policy_store_url: None,
+            policy_store_token: None,
+            embedded_policy: Some(policy),
+            embedded_schema: Some(embedded_schema),
+        };
+
+        // Must initialize AND validate the Doc-referencing policy — proving
+        // the file schema (not the embedded one) was used.
+        let authorizer = CedarAuthorizer::new(config).unwrap();
+
+        let request = Request::new(
+            parse_uid(r#"User::"alice""#),
+            parse_uid(r#"Action::"View""#),
+            parse_uid(r#"Doc::"d1""#),
+            Context::empty(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            authorizer.is_allowed(&request).allowed(),
+            "Doc entity must exist when the file schema wins"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When no schema file exists on disk, the embedded schema is still used.
+    #[test]
+    fn test_embedded_schema_used_when_no_file() {
+        let schema_str = r#"
+            entity User;
+            entity File;
+            action View appliesTo { principal: [User], resource: [File] };
+        "#;
+        let config = CedarConfig {
+            policy_path: "/nonexistent".into(),
+            schema_path: Some(std::path::PathBuf::from("/nonexistent/schema.cedarschema")),
+            entities_path: None,
+            default_decision: super::super::config::DefaultDecision::Deny,
+            validate_on_load: true,
+            policy_store_url: None,
+            policy_store_token: None,
+            embedded_policy: Some(
+                r#"permit(principal == User::"alice", action == Action::"View", resource == File::"f1");"#,
+            ),
+            embedded_schema: Some(schema_str),
+        };
+
+        let authorizer = CedarAuthorizer::new(config).unwrap();
+        let request = Request::new(
+            parse_uid(r#"User::"alice""#),
+            parse_uid(r#"Action::"View""#),
+            parse_uid(r#"File::"f1""#),
+            Context::empty(),
+            None,
+        )
+        .unwrap();
+        assert!(authorizer.is_allowed(&request).allowed());
     }
 }
