@@ -8,7 +8,7 @@
 //! Enum dispatch via `TokenProviderEnum` for dynamic selection.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing;
 
@@ -32,6 +32,15 @@ use crate::token_store::{TokenStore, StoredToken};
 pub trait TokenProvider: Send + Sync {
     /// Return a valid (possibly freshly obtained) access token.
     async fn get_token(&self) -> Result<String>;
+
+    /// Drop any cached token so the next `get_token()` performs a full
+    /// refresh. Default: no-op — stateless providers (e.g.
+    /// [`StaticTokenProvider`]) hold nothing to drop.
+    ///
+    /// HTTP clients use this for the single retry-on-401 pattern: on an
+    /// expired/invalid-token rejection, `invalidate()` then re-request the
+    /// token exactly once.
+    async fn invalidate(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -39,28 +48,62 @@ pub trait TokenProvider: Send + Sync {
 // ---------------------------------------------------------------------------
 
 /// In-memory cached token with expiry tracking.
+///
+/// Expiry is wall-clock (`SystemTime`), not monotonic: the authoritative
+/// expiry is the JWT's `exp` claim, which lives in IdP wall-clock time.
 #[derive(Clone, Debug)]
 struct CachedToken {
     token: String,
-    expires_at: Instant,
+    expires_at: SystemTime,
 }
 
 impl CachedToken {
+    /// Refresh buffer before expiry. Mirrors the session manager's
+    /// clock-skew posture (0.4.4 raised its default 60 → 120 seconds after
+    /// the expired-token race in nghr #40ad7123).
+    const BUFFER_SECS: u64 = 120;
+
     /// Create a new cached entry from a token response.
+    ///
+    /// Expiry is taken from the token's REAL `exp` claim when the access
+    /// token is a decodable JWT — IdPs (Kanidm included) have been observed
+    /// to mint tokens whose actual lifetime is shorter than the exchange
+    /// response's `expires_in` (nghr #40ad7123; trustee 199c4801: recurring
+    /// ~15-min Cedar fail-closed windows on the MCP service-account path).
+    /// Falls back to the `expires_in` estimate (default 900s) for opaque
+    /// tokens. This ports the session_manager 0.5.3 fix (d7b485d) to the
+    /// service path.
     fn from_response(token_response: &TokenResponse) -> Self {
-        let expires_in = token_response.expires_in.unwrap_or(900);
-        // Refresh 30 seconds before actual expiry to avoid edge cases
-        let buffer_secs = 30;
-        let effective_secs = expires_in.saturating_sub(buffer_secs);
+        let buffer = Duration::from_secs(Self::BUFFER_SECS);
+        let expires_at = match jwt_exp_epoch(&token_response.access_token) {
+            Some(exp_epoch) => {
+                tracing::debug!(
+                    jwt_exp = exp_epoch,
+                    buffer_secs = Self::BUFFER_SECS,
+                    "CachedToken: using real JWT exp claim for expiry"
+                );
+                UNIX_EPOCH + Duration::from_secs(exp_epoch).saturating_sub(buffer)
+            }
+            None => {
+                let expires_in = token_response.expires_in.unwrap_or(900);
+                tracing::debug!(
+                    expires_in,
+                    buffer_secs = Self::BUFFER_SECS,
+                    "CachedToken: no JWT exp claim, using expires_in estimate"
+                );
+                SystemTime::now()
+                    + Duration::from_secs(expires_in.saturating_sub(Self::BUFFER_SECS))
+            }
+        };
         Self {
             token: token_response.access_token.clone(),
-            expires_at: Instant::now() + Duration::from_secs(effective_secs),
+            expires_at,
         }
     }
 
     /// Returns `true` if the token is still valid (with buffer).
     fn is_valid(&self) -> bool {
-        Instant::now() < self.expires_at
+        SystemTime::now() < self.expires_at
     }
 }
 
@@ -210,6 +253,19 @@ impl TokenProvider for ServiceAccountTokenProvider {
 
         Ok(token)
     }
+
+    /// Drop the cached token; the next `get_token()` performs a full
+    /// RFC 8693 exchange. Used by HTTP clients for the single
+    /// retry-on-401 pattern.
+    async fn invalidate(&self) {
+        let mut cache = self.cache.write().await;
+        if cache.take().is_some() {
+            tracing::debug!(
+                audience = %self.config.audience,
+                "ServiceAccountTokenProvider cache invalidated"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -303,12 +359,10 @@ impl TokenProvider for InteractiveTokenProvider {
 
         // 3. If access token is still valid, use it
         if !stored.is_expired() {
+            let remaining = seconds_until_expiry(&stored.expires_at).max(1);
             let cached = CachedToken {
                 token: stored.access_token.clone(),
-                expires_at: Instant::now()
-                    + Duration::from_secs(
-                        seconds_until_expiry(&stored.expires_at).max(1),
-                    ),
+                expires_at: UNIX_EPOCH + Duration::from_secs(now_epoch() + remaining),
             };
             let token = cached.token.clone();
             {
@@ -391,6 +445,14 @@ impl TokenProvider for InteractiveTokenProvider {
 // Helpers for InteractiveTokenProvider
 // ---------------------------------------------------------------------------
 
+/// Current UNIX epoch seconds.
+pub(crate) fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Compute the number of seconds until the given RFC-3339 timestamp.
 ///
 /// Returns 0 if the timestamp is in the past or cannot be parsed.
@@ -415,6 +477,39 @@ pub(crate) fn compute_expires_at(expires_in: Option<u64>) -> String {
     epoch_to_rfc3339(expires_epoch)
 }
 
+/// Extract the raw `exp` epoch seconds from a JWT payload, if decodable.
+///
+/// Decodes the JWT payload WITHOUT signature verification — only the `exp`
+/// field is read. Returns `None` for non-JWT tokens, malformed payloads, or
+/// tokens without an `exp` claim. Single decode path shared by
+/// [`CachedToken::from_response`] and [`compute_expires_at_from_jwt`].
+fn jwt_exp_epoch(access_token: &str) -> Option<u64> {
+    // JWT structure: header.payload.signature — we only need the payload
+    let parts: Vec<&str> = access_token.split('.').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    use base64::Engine;
+    let payload = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // Try standard base64 as fallback
+            match base64::engine::general_purpose::STANDARD_NO_PAD.decode(parts[1]) {
+                Ok(bytes) => bytes,
+                Err(_) => return None,
+            }
+        }
+    };
+
+    let payload_json: serde_json::Value = match serde_json::from_slice(&payload) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+
+    payload_json.get("exp").and_then(|v| v.as_u64())
+}
+
 /// Compute expiry from the actual JWT `exp` claim.
 ///
 /// Decodes the JWT payload (without signature verification — we only need
@@ -428,38 +523,18 @@ pub(crate) fn compute_expires_at_from_jwt(
     access_token: &str,
     expires_in_fallback: Option<u64>,
 ) -> String {
-    // JWT structure: header.payload.signature — we only need the payload
-    let parts: Vec<&str> = access_token.split('.').collect();
-    if parts.len() < 2 {
-        return compute_expires_at(expires_in_fallback);
-    }
-
-    use base64::Engine;
-    let payload = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            // Try standard base64 as fallback
-            match base64::engine::general_purpose::STANDARD_NO_PAD.decode(parts[1]) {
-                Ok(bytes) => bytes,
-                Err(_) => return compute_expires_at(expires_in_fallback),
-            }
+    match jwt_exp_epoch(access_token) {
+        Some(exp) => {
+            tracing::debug!(
+                jwt_exp = exp,
+                "Extracted real exp from JWT payload for expiry tracking"
+            );
+            epoch_to_rfc3339(exp)
         }
-    };
-
-    let payload_json: serde_json::Value = match serde_json::from_slice(&payload) {
-        Ok(v) => v,
-        Err(_) => return compute_expires_at(expires_in_fallback),
-    };
-
-    if let Some(exp) = payload_json.get("exp").and_then(|v| v.as_u64()) {
-        tracing::debug!(
-            jwt_exp = exp,
-            "Extracted real exp from JWT payload for expiry tracking"
-        );
-        epoch_to_rfc3339(exp)
-    } else {
-        tracing::debug!("No exp claim in JWT, falling back to expires_in estimate");
-        compute_expires_at(expires_in_fallback)
+        None => {
+            tracing::debug!("No exp claim in JWT, falling back to expires_in estimate");
+            compute_expires_at(expires_in_fallback)
+        }
     }
 }
 
@@ -517,6 +592,17 @@ impl TokenProvider for TokenProviderEnum {
             Self::Static(p) => p.get_token().await,
             Self::ServiceAccount(p) => p.get_token().await,
             Self::Interactive(p) => p.get_token().await,
+        }
+    }
+
+    /// Delegates to the wrapped provider. NOTE: this MUST be an explicit
+    /// override — trait default methods do not dispatch through enum
+    /// wrappers, and the trait default is a no-op.
+    async fn invalidate(&self) {
+        match self {
+            Self::Static(p) => p.invalidate().await,
+            Self::ServiceAccount(p) => p.invalidate().await,
+            Self::Interactive(p) => p.invalidate().await,
         }
     }
 }
@@ -658,5 +744,148 @@ mod tests {
             credential_name: "test_interactive".to_string(),
         };
         assert_eq!(config.credential_name, "test_interactive");
+    }
+
+    // -- real-JWT-exp expiry (nghr 849e7528) ---------------------------------
+
+    /// Build a minimal unsigned JWT with the given `exp` epoch claim.
+    fn jwt_with_exp(exp_epoch: u64) -> String {
+        use base64::Engine;
+        let b64 = |b: &[u8]| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+        };
+        let header = b64(br#"{"alg":"none"}"#);
+        let payload = b64(format!(r#"{{"exp":{exp_epoch}}}"#).as_bytes());
+        format!("{header}.{payload}.sig")
+    }
+
+    #[test]
+    fn from_response_honors_real_jwt_exp_over_expires_in() {
+        // IdP claims 900s remaining, but the JWT really expires in 300s —
+        // the cache MUST honor the real exp (nghr #40ad7123 class of bug).
+        let exp_epoch = now_epoch() + 300;
+        let response = TokenResponse {
+            access_token: jwt_with_exp(exp_epoch),
+            token_type: "Bearer".to_string(),
+            expires_in: Some(900),
+            refresh_token: None,
+            id_token: None,
+            scope: None,
+        };
+        let cached = CachedToken::from_response(&response);
+        // Exact: real-exp path involves no now() arithmetic.
+        let expected =
+            UNIX_EPOCH + Duration::from_secs(exp_epoch - CachedToken::BUFFER_SECS);
+        assert_eq!(cached.expires_at, expected);
+        assert!(cached.is_valid());
+    }
+
+    #[test]
+    fn from_response_falls_back_to_estimate_without_jwt_exp() {
+        // Opaque token: expires_in estimate applies (900 - 120 buffer).
+        let response = TokenResponse {
+            access_token: "not-a-jwt".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: Some(900),
+            refresh_token: None,
+            id_token: None,
+            scope: None,
+        };
+        let cached = CachedToken::from_response(&response);
+        let expected = SystemTime::now() + Duration::from_secs(900 - 120);
+        let drift = cached
+            .expires_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .abs_diff(expected.duration_since(UNIX_EPOCH).unwrap().as_secs());
+        assert!(drift <= 2, "estimate drift {drift}s too large");
+        assert!(cached.is_valid());
+    }
+
+    #[test]
+    fn from_response_malformed_jwt_falls_back_to_estimate() {
+        let response = TokenResponse {
+            access_token: "aGk.not-base64-json.sig".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: Some(600),
+            refresh_token: None,
+            id_token: None,
+            scope: None,
+        };
+        let cached = CachedToken::from_response(&response);
+        let expected = SystemTime::now() + Duration::from_secs(600 - 120);
+        let drift = cached
+            .expires_at
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .abs_diff(expected.duration_since(UNIX_EPOCH).unwrap().as_secs());
+        assert!(drift <= 2, "estimate drift {drift}s too large");
+    }
+
+    #[test]
+    fn real_exp_shorter_than_buffer_renders_token_invalid() {
+        // JWT expiring sooner than the buffer: must NOT be served at all
+        // (fail-safe: immediate re-exchange on next get_token).
+        let exp_epoch = now_epoch() + 30; // < BUFFER_SECS
+        let response = TokenResponse {
+            access_token: jwt_with_exp(exp_epoch),
+            token_type: "Bearer".to_string(),
+            expires_in: Some(900),
+            refresh_token: None,
+            id_token: None,
+            scope: None,
+        };
+        let cached = CachedToken::from_response(&response);
+        assert!(!cached.is_valid());
+    }
+
+    // -- TokenProvider::invalidate (nghr 849e7528) ---------------------------
+
+    #[tokio::test]
+    async fn invalidate_clears_service_account_cache() {
+        let provider = ServiceAccountTokenProvider::new(ServiceAccountConfig {
+            service_token: "svc".to_string(),
+            issuer_url: "https://idm.example".to_string(),
+            client_id: "pdt-api".to_string(),
+            client_secret: None,
+            audience: "pdt-api".to_string(),
+            scope: None,
+        });
+        // Seed the private cache directly (same-module test).
+        *provider.cache.write().await = Some(CachedToken {
+            token: "stale".to_string(),
+            expires_at: SystemTime::now() + Duration::from_secs(600),
+        });
+        provider.invalidate().await;
+        assert!(provider.cache.read().await.is_none());
+        // Invalidating an empty cache is a no-op, not an error.
+        provider.invalidate().await;
+    }
+
+    #[tokio::test]
+    async fn enum_invalidate_dispatches_to_inner_provider() {
+        let provider = ServiceAccountTokenProvider::new(ServiceAccountConfig {
+            service_token: "svc".to_string(),
+            issuer_url: "https://idm.example".to_string(),
+            client_id: "pdt-api".to_string(),
+            client_secret: None,
+            audience: "pdt-api".to_string(),
+            scope: None,
+        });
+        *provider.cache.write().await = Some(CachedToken {
+            token: "stale".to_string(),
+            expires_at: SystemTime::now() + Duration::from_secs(600),
+        });
+        let wrapped = TokenProviderEnum::ServiceAccount(provider);
+        // Trait-level call must dispatch through the enum override —
+        // the trait default (no-op) would silently keep the stale token.
+        TokenProvider::invalidate(&wrapped).await;
+        let ServiceAccountTokenProvider { cache, .. } = match &wrapped {
+            TokenProviderEnum::ServiceAccount(p) => p,
+            _ => unreachable!(),
+        };
+        assert!(cache.read().await.is_none());
     }
 }
