@@ -1,6 +1,6 @@
 //! Resource server functionality for JWT validation and API protection
 
-use std::{collections::HashMap, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use jsonwebtoken::jwk::JwkSet;
 use reqwest::Client;
@@ -9,6 +9,12 @@ use tracing;
 
 use crate::error::{PepError, Result};
 use super::types::{JwtClaims, OidcDiscoveryDocument, CachedJwks, CachedDiscoveryRaw, JwtValidationOptions};
+
+/// Minimum interval between forced JWKS refreshes for the same `jwks_uri`.
+///
+/// Storm guard: a burst of tokens bearing unknown/random kids must not hammer
+/// the IdP's JWKS endpoint — at most one forced fetch per interval.
+const FORCED_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Cache entry for userinfo endpoint responses
 #[derive(Clone)]
@@ -127,6 +133,8 @@ pub struct ResourceServerClient {
     pub discovery_cache_raw: Arc<RwLock<HashMap<String, CachedDiscoveryRaw>>>,
     /// Userinfo response cache (keyed by jti/sub, TTL = token remaining lifetime)
     pub userinfo_cache: Arc<UserInfoCache>,
+    /// Last forced JWKS refresh per jwks_uri (storm guard for IdP key rotation)
+    pub last_forced_fetch: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl ResourceServerClient {
@@ -138,6 +146,7 @@ impl ResourceServerClient {
             discovery_cache: Arc::new(RwLock::new(HashMap::new())),
             discovery_cache_raw: Arc::new(RwLock::new(HashMap::new())),
             userinfo_cache: Arc::new(UserInfoCache::new()),
+            last_forced_fetch: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -230,13 +239,20 @@ impl ResourceServerClient {
 
     /// Fetch JWKS with caching
     pub async fn get_jwks(&self, jwks_uri: &str) -> Result<HashMap<String, (DecodingKey, Algorithm)>> {
-        // Check cache first
-        {
-            let cache = self.jwks_cache.read().await;
-            if let Some(cached) = cache.get(jwks_uri) {
-                // Cache for 1 hour
-                if cached.fetched_at.elapsed().unwrap_or(cached.cache_duration) < cached.cache_duration {
-                    return Ok(cached.keys.clone());
+        self.get_jwks_inner(jwks_uri, false).await
+    }
+
+    /// Fetch JWKS, optionally bypassing the cache TTL (`force_refresh = true`).
+    async fn get_jwks_inner(&self, jwks_uri: &str, force_refresh: bool) -> Result<HashMap<String, (DecodingKey, Algorithm)>> {
+        if !force_refresh {
+            // Check cache first
+            {
+                let cache = self.jwks_cache.read().await;
+                if let Some(cached) = cache.get(jwks_uri) {
+                    // Cache for 1 hour
+                    if cached.fetched_at.elapsed().unwrap_or(cached.cache_duration) < cached.cache_duration {
+                        return Ok(cached.keys.clone());
+                    }
                 }
             }
         }
@@ -303,6 +319,32 @@ impl ResourceServerClient {
         Ok(keys)
     }
 
+    /// Force-refresh the JWKS for `jwks_uri`, bypassing the cache TTL.
+    ///
+    /// Storm-guarded: the attempt timestamp is recorded BEFORE fetching (so
+    /// failed fetches are rate-limited too), and when a forced refresh already
+    /// happened within `FORCED_REFRESH_MIN_INTERVAL`, the cached keys are
+    /// served instead of hitting the IdP again.
+    async fn force_refresh_jwks(&self, jwks_uri: &str) -> Result<HashMap<String, (DecodingKey, Algorithm)>> {
+        {
+            let mut last = self.last_forced_fetch.write().await;
+            let now = Instant::now();
+            if let Some(prev) = last.get(jwks_uri) {
+                if now.duration_since(*prev) < FORCED_REFRESH_MIN_INTERVAL {
+                    drop(last);
+                    tracing::debug!("Storm guard held for {} — serving cached JWKS instead of forced refresh", jwks_uri);
+                    let cache = self.jwks_cache.read().await;
+                    if let Some(cached) = cache.get(jwks_uri) {
+                        return Ok(cached.keys.clone());
+                    }
+                    return self.get_jwks_inner(jwks_uri, false).await;
+                }
+            }
+            last.insert(jwks_uri.to_string(), now);
+        }
+        self.get_jwks_inner(jwks_uri, true).await
+    }
+
     /// Validate JWT token with custom validation options
     pub async fn validate_jwt_with_options(
         &self,
@@ -322,9 +364,22 @@ impl ResourceServerClient {
         let discovery_doc = self.get_discovery_document(issuer_url).await?;
 
         // Get JWKS
-        let keys = self.get_jwks(&discovery_doc.jwks_uri).await?;
+        let mut keys = self.get_jwks(&discovery_doc.jwks_uri).await?;
 
-        // Find the key for this kid
+        // Find the key for this kid. On a miss, the IdP may have rotated its
+        // signing keys after our cached JWKS was fetched — force one refresh
+        // (storm-guarded) and retry the lookup before failing.
+        if !keys.contains_key(&kid) {
+            tracing::info!(
+                "kid {} not in cached JWKS for {} — forcing refresh",
+                kid,
+                discovery_doc.jwks_uri
+            );
+            if let Err(e) = self.force_refresh_jwks(&discovery_doc.jwks_uri).await {
+                tracing::warn!("Forced JWKS refresh failed for {}: {}", discovery_doc.jwks_uri, e);
+            }
+            keys = self.get_jwks(&discovery_doc.jwks_uri).await?;
+        }
         let (decoding_key, key_algorithm) = keys.get(&kid)
             .ok_or_else(|| PepError::JwtValidation(format!("No key found for kid: {}", kid)))?;
 

@@ -1,6 +1,6 @@
 [package]
 name = "pep"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2021"
 description = "Policy Enforcement Point - OIDC authentication and authorization library"
 license = "MIT OR Apache-2.0"

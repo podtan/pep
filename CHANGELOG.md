@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.7 — 2026-10-03
+
+### Fixed
+
+- **JWKS rotation resilience** (nghr c83a8215): after an IdP rotates its signing
+  keys, tokens signed by the new `kid` were rejected with `No key found for
+  kid` for up to 1 hour per process (the JWKS cache TTL) — restart was the only
+  cure. `validate_jwt*` now force-refreshes the JWKS (bypassing the TTL) when
+  the `kid` is missing from the cached keys, and retries the lookup once before
+  failing. Field case: Kanidm key rotation locked out console/dispatch on a
+  trustee node until process restart.
+- Storm guard on forced refreshes: rate-limited per `jwks_uri` (minimum 30s
+  between forced fetches, at most one forced fetch per validation). The guard
+  timestamp is recorded on attempt, so fetch failures are rate-limited too.
+  The 1h cache TTL is unchanged for the normal path.
+
+### Added
+
+- Regression tests (`tests/jwks_rotation.rs`) with an in-process mock IdP:
+  key rotation mid-flight validates without restart; forced-fetch count is
+  bounded (≤1) under a storm of unknown-kid tokens.
+
 ## 0.4.4 — 2026-07-22
 
 ### Added
