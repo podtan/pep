@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.5.8 — 2026-10-03
+
+### Fixed
+
+- **FAIL-CLOSED userinfo enrichment (breaking behavior change, owner FIX ORDER
+  payam a77cd19c)**: `enrich_claims_with_userinfo` no longer swallows userinfo
+  failures. Previously an HTTP error from the userinfo endpoint (400/401
+  invalid_token mid-flight, 5xx) was logged and converted to `Ok(())`, so
+  requests proceeded with NO groups/role — Cedar scoped to zero, filtered reads
+  answered 200-empty (the "lying-empty" incident class: F1, F3, 365be03f) and
+  downstream 401/degraded guards never fired. The swallow is dead.
+
+### Added
+
+- `PepError::AuthDegraded { detail, retryable }` — the distinguishable state
+  between "userinfo returned no groups" and "we could not ask the userinfo
+  endpoint". `PepError::is_auth_degraded()` and `PepError::retryable()`
+  classifiers for guards that must not match exhaustively.
+- `status_code()` mapping: `AuthDegraded` retryable → **503 SERVICE_UNAVAILABLE**
+  (reads may retry), non-retryable → **401 UNAUTHORIZED** (terminal for the
+  token → deny writes).
+- Regression tests (`tests/userinfo_degraded.rs`) reproducing the incident wire:
+  userinfo 400 / 503 / connection-refused mid-flight each surface
+  `AuthDegraded` with correct retryability; healthy-200 enrichment and the
+  groups-fast-path are unchanged.
+
+### Upgrade / adoption notes (fame, tocpi, nghr, thq, trustee-api)
+
+- **Adopt by crate bump only** (`pep = "0.5"`): no coordinated cutover, no
+  required consumer code changes to receive the honest signal. Consumers that
+  propagate `Result` from `enrich_claims_with_userinfo` now get fail-closed
+  semantics automatically.
+- **Guard activation**: middleware should classify with
+  `err.is_auth_degraded()` and map `err.retryable()` → retryable 503-class
+  response vs deny. `status_code()` already encodes this mapping.
+- **trustee-api note**: its enrichment call site currently absorbs errors with
+  an error-grade log (auth.rs ~L526) — the signal is now *visible and
+  distinguishable* there; mapping it to 503/deny responses is trustee-api's own
+  follow-up bump (separate Paydar-window event, per the blast-radius ruling).
+- **Semver**: `PepError` is now `#[non_exhaustive]`; exhaustive `match`es must
+  add a wildcard arm. Shipped as 0.5.8 (not 0.6.0) deliberately so consumers
+  pinned to `pep = "0.5"` pick it up by bump — do not skip this reasoning in
+  future releases.
+- Caching (JWKS 1h TTL, userinfo per-token TTL) is unchanged; the bug was the
+  swallow, not the cache.
+
 ## 0.5.7 — 2026-10-03
 
 ### Fixed

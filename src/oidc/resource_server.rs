@@ -511,31 +511,43 @@ impl ResourceServerClient {
 
         tracing::debug!(userinfo_url = %userinfo_url, "Calling userinfo endpoint for claims enrichment");
 
-        // Call the userinfo endpoint with the access token as Bearer
+        // Call the userinfo endpoint with the access token as Bearer.
+        // FAIL-CLOSED contract: any transport failure here surfaces as
+        // `PepError::AuthDegraded` — NEVER as silent empty-claims success.
         let response = self.http_client
             .get(&userinfo_url)
             .header("Authorization", format!("Bearer {}", token))
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| PepError::Userinfo(format!("Userinfo request failed: {}", e)))?;
+            .map_err(|e| PepError::AuthDegraded {
+                detail: format!("userinfo request failed ({}): {}", userinfo_url, e),
+                // timeout / connection refused / TLS: transient — retry may succeed
+                retryable: true,
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let retryable = status.is_server_error() || status.as_u16() == 429;
             tracing::warn!(
-                userinfo_url = %userinfo_url, status = %status,
-                "Userinfo endpoint returned error: {}", body
+                userinfo_url = %userinfo_url, status = %status, retryable,
+                "Userinfo endpoint returned error — surfacing auth_degraded (fail-closed)"
             );
-            // Non-fatal: enrichment failed but JWT is still valid.
-            // Return Ok so the request proceeds with whatever claims we have.
-            return Ok(());
+            // 4xx (e.g. 400/401 invalid_token mid-flight): terminal for this
+            // token → deny. 5xx/429: transient → retryable 503-class.
+            return Err(PepError::AuthDegraded {
+                detail: format!("userinfo returned HTTP {} for {}", status, userinfo_url),
+                retryable,
+            });
         }
 
         let userinfo: serde_json::Map<String, serde_json::Value> = response
             .json()
             .await
-            .map_err(|e| PepError::Userinfo(format!("Failed to parse userinfo response: {}", e)))?;
+            .map_err(|e| PepError::AuthDegraded {
+                detail: format!("userinfo response malformed: {}", e),
+                retryable: true,
+            })?;
 
         tracing::debug!(
             userinfo_keys = ?userinfo.keys().collect::<Vec<_>>(),
