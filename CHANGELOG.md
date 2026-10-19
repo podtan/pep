@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.5.9 — 2026-10-19
+
+### Added
+
+- **PROACTIVE TOKEN REFRESH at T-90s (order payam ece49472, clause 1)**:
+  `ServiceAccountTokenProvider` no longer serves a cached token whose
+  remaining life is at or below `ServiceAccountTokenProvider::
+  PROACTIVE_REFRESH_SECS` (90s) — the next `get_token()` exchanges instead.
+  New `spawn_proactive_refresh()` runs a background task that exchanges at
+  the horizon WITHOUT caller pressure, so long-idle processes always hold a
+  live token. Failure posture: refresh failures log (warn) and retry after a
+  5s backoff; `get_token()` still fails LOUD if the IdP stays down —
+  fail-closed, never a lying success. Closes the payam v0.2.5 send-path
+  outage wire at the provider layer (nghr 374803e5: activity does not
+  trigger refresh, so the provider must not need activity).
+  Effective lazy horizon is `exp − 210s` (120s skew/transit buffer + 90s
+  proactive horizon compose).
+
+- **UNIVERSAL 401 RETRY driver (order payam ece49472, clause 2)**:
+  `with_token_retry(provider, attempt)` + `Attempt<T>` (`Served` /
+  `StaleToken` / `Failed`). One driver for reads AND writes — the closure
+  picks the verb. On a 401 the driver invalidates the cached token, re-mints,
+  and retries EXACTLY once. Why retrying writes is safe: `StaleToken` is only
+  for 401 responses, which arrive INSTEAD of execution — a 401'd request was
+  never authenticated, hence never executed. 403 is authorization, not
+  staleness: map it to `Attempt::Failed` so it stays terminal. Double-401 is
+  terminal: `PepError::AuthDegraded { retryable: false }`. Non-401 errors
+  pass through untouched, never retried.
+
+- **REAL-EXP AUDIT fixes (order payam ece49472, clause 3; nghr 849e7528
+  class)**: `InteractiveTokenProvider`'s refresh path persisted the
+  `expires_in` ESTIMATE as the stored token's `expires_at`, disagreeing with
+  the in-memory cache (which honors the real JWT `exp` since 1059cad). A
+  restart therefore resurrected an over-lived token. The stored record now
+  uses `compute_expires_at_from_jwt` — real `exp` when decodable, estimate
+  only for opaque tokens. Service-account path audited: correct since 0.5.5
+  (1059cad), tests present.
+
+### Semver ruling (recorded per checklist v2)
+
+0.5.9, NOT 0.6.0: consumers pin `pep = "0.5"`; a patch release is adopted by
+a plain version bump. The new API is purely additive; the one behavior change
+(never serve a token inside the T-90s horizon) is the fix itself — a token
+that can die mid-request must not be handed out. `PepError` remains
+`#[non_exhaustive]` (since 0.5.8); consumers must not exhaustive-match.
+
+### Tests
+
+`tests/token_hardening.rs` (9): T-90 lazy gate + no-churn control; proactive
+refresher with no caller pressure + no-churn-when-fresh control; IdP outage
+fail-loud (refresher survives, get_token errors); 401→re-mint→retry-once on a
+write path (and reads take the identical path); double-401 terminal
+AuthDegraded (bounded at two attempts); non-401 pass-through (no retry, no
+re-mint); static-provider participation; real-exp persistence on Interactive
+refresh (stored record = real exp, NOT the estimate). 181 total green,
+including lib + doc suites.
+
+### Honesty flags
+
+- The order cites thq v0.9.2 as the live-proven reference for the T-90s
+  pattern; the thq source was NOT available locally (no clone at
+  /Projects/Podtan/thq, no thq crate in the trustee workspace). Implemented
+  from the order's specification (T-90s horizon + background refresher +
+  fail-loud posture). Pattern-parity with thq v0.9.2: UNVERIFIED — flagged
+  for whoever holds the thq tree.
+
 ## 0.5.8 — 2026-10-03
 
 ### Fixed

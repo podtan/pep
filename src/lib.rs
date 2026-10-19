@@ -124,6 +124,7 @@ pub use token_provider::{
     TokenProvider, TokenProviderEnum,
     StaticTokenProvider, ServiceAccountTokenProvider, ServiceAccountConfig,
     InteractiveConfig, InteractiveTokenProvider,
+    Attempt, with_token_retry,
 };
 
 // Re-export token store types

@@ -105,6 +105,19 @@ impl CachedToken {
     fn is_valid(&self) -> bool {
         SystemTime::now() < self.expires_at
     }
+
+    /// Seconds of usable life left (0 if past `expires_at`).
+    fn seconds_remaining(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|now| {
+                self.expires_at
+                    .duration_since(UNIX_EPOCH + Duration::from_secs(now.as_secs()))
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +196,20 @@ impl std::fmt::Debug for ServiceAccountTokenProvider {
 }
 
 impl ServiceAccountTokenProvider {
+    /// Proactive-refresh horizon: when a cached token's remaining life drops
+    /// to this many seconds, it is no longer served from cache — the next
+    /// `get_token()` exchanges, and a spawned proactive refresher exchanges
+    /// without waiting for a caller (order payam ece49472, clause 1; same
+    /// pattern class as thq v0.9.2).
+    ///
+    /// Composes with [`CachedToken::BUFFER_SECS`] (120s clock-skew/transit
+    /// safety): a minted token with 900s life is cached with `exp - 120s`, so
+    /// the effective lazy exchange point is `exp - 210s` and the proactive
+    /// task fires at the same threshold. Callers never hold a token that can
+    /// die mid-request — the payam v0.2.5 send-path outage wire (nghr
+    /// 374803e5).
+    pub const PROACTIVE_REFRESH_SECS: u64 = 90;
+
     /// Create a new service account token provider.
     pub fn new(config: ServiceAccountConfig) -> Self {
         Self {
@@ -228,30 +255,83 @@ impl ServiceAccountTokenProvider {
 
         Ok(CachedToken::from_response(&response))
     }
+
+    /// Exchange a fresh token and install it in the cache.
+    async fn refresh_cache(&self) -> Result<()> {
+        let cached = self.exchange().await?;
+        *self.cache.write().await = Some(cached);
+        Ok(())
+    }
+
+    /// Spawn a background task that keeps the cache fresh proactively: it
+    /// exchanges at the T-90s horizon (`PROACTIVE_REFRESH_SECS`) WITHOUT
+    /// waiting for a caller, so long-idle processes (payam sends during
+    /// quiet periods — nghr 374803e5) never start an operation on a dying
+    /// token.
+    ///
+    /// Failure posture: an exchange failure is logged (warn) and retried
+    /// after a 5s backoff — the cache keeps its previous token, and
+    /// `get_token()` still fails LOUD if the cache empties and the IdP stays
+    /// down (fail-closed; never a lying empty/success).
+    ///
+    /// The task lives until the returned handle is aborted; it holds a clone
+    /// of the provider (cheap: `Arc` internals), so dropping the original is
+    /// safe either way. Idempotent per cache state — safe to call once at
+    /// startup.
+    pub fn spawn_proactive_refresh(&self) -> tokio::task::JoinHandle<()> {
+        let this = self.clone();
+        tokio::spawn(async move {
+            loop {
+                // Sleep until the T-90s horizon (or exchange now if the
+                // cache is empty / already at horizon).
+                let wait = {
+                    let cache = this.cache.read().await;
+                    match cache.as_ref() {
+                        Some(t) => Duration::from_secs(
+                            t.seconds_remaining().saturating_sub(Self::PROACTIVE_REFRESH_SECS),
+                        ),
+                        None => Duration::ZERO,
+                    }
+                };
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                if let Err(e) = this.refresh_cache().await {
+                    tracing::warn!(
+                        audience = %this.config.audience,
+                        error = %e,
+                        "pep: proactive token refresh failed; retrying in 5s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        })
+    }
 }
 
 impl TokenProvider for ServiceAccountTokenProvider {
     async fn get_token(&self) -> Result<String> {
-        // Fast path: check read lock
+        // Fast path: serve the cached token ONLY if it outlives the T-90s
+        // proactive-refresh horizon. A token this close to death can expire
+        // mid-request — the exact payam 374803e5 incident wire — so it is
+        // exchanged instead of served.
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.as_ref() {
-                if cached.is_valid() {
+                if cached.seconds_remaining() > Self::PROACTIVE_REFRESH_SECS {
                     return Ok(cached.token.clone());
                 }
             }
         }
 
-        // Slow path: exchange and write
-        let cached = self.exchange().await?;
-        let token = cached.token.clone();
-
-        {
-            let mut cache = self.cache.write().await;
-            *cache = Some(cached);
-        }
-
-        Ok(token)
+        // Slow path: exchange and write.
+        self.refresh_cache().await?;
+        let cache = self.cache.read().await;
+        Ok(cache
+            .as_ref()
+            .expect("cache was just written by refresh_cache")
+            .token
+            .clone())
     }
 
     /// Drop the cached token; the next `get_token()` performs a full
@@ -401,8 +481,13 @@ impl TokenProvider for InteractiveTokenProvider {
 
         match response {
             Ok(token_response) => {
-                // Build updated StoredToken
-                let new_expires_at = compute_expires_at(token_response.expires_in);
+                // Persist updated tokens. Expiry comes from the token's REAL
+                // `exp` claim (falls back to `expires_in` for opaque tokens) —
+                // the stored record must agree with the in-memory cache, or a
+                // restart resurrects an over-lived token (real-exp audit,
+                // order payam ece49472 clause 3; nghr 849e7528 class).
+                let new_expires_at =
+                    compute_expires_at_from_jwt(&token_response.access_token, token_response.expires_in);
                 let updated = StoredToken::new(
                     &token_response.access_token,
                     token_response.refresh_token.clone().or(Some(refresh_token)),
@@ -566,6 +651,100 @@ fn epoch_to_civil(days: u64) -> (u32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
     let y = if m <= 2 { y + 1 } else { y };
     (y as u32, m as u32, d as u32)
+}
+
+// ---------------------------------------------------------------------------
+// Universal 401 retry driver (order payam ece49472, clause 2)
+// ---------------------------------------------------------------------------
+
+/// The outcome of ONE request attempt, fed to [`with_token_retry`].
+///
+/// The mapping is the consumer's job and is method-agnostic by construction:
+/// an HTTP 401 response maps to [`Attempt::StaleToken`] regardless of whether
+/// the request was a GET or a POST — a 401 means the request was never
+/// authenticated, therefore never executed, therefore always safe to retry
+/// after a re-mint. A 403 is authorization, NOT staleness — map it to
+/// [`Attempt::Failed`] so it stays terminal and is never retried.
+#[derive(Debug)]
+pub enum Attempt<T> {
+    /// The request completed. Carry the response through.
+    Served(T),
+    /// The server answered 401 Unauthorized: the bearer token was rejected
+    /// before the request could execute. The driver re-mints the token and
+    /// retries exactly once.
+    StaleToken,
+    /// The request failed with any other error — passed through untouched,
+    /// never retried by the driver.
+    Failed(PepError),
+}
+
+/// Run an authenticated request with the universal single-retry-on-401
+/// posture: obtain a token, attempt the request, and on a 401 reject the
+/// cache, re-mint, and retry exactly ONCE — for reads AND writes alike
+/// (order payam ece49472, clause 2).
+///
+/// Why retrying writes is safe here: [`Attempt::StaleToken`] is only for 401
+/// responses, which by definition arrive instead of execution. The one
+/// honest caveat: if a server ever executes a write AND answers 401, that is
+/// a server bug this driver surfaces rather than hides — the retry is still
+/// bounded at one.
+///
+/// Double-401 (still rejected after a fresh mint) is terminal:
+/// [`PepError::AuthDegraded`] with `retryable: false` — the credential
+/// itself is wrong, not stale; hammering it will not help.
+///
+/// ```no_run
+/// # async fn demo<P: pep::TokenProvider>(provider: &P) -> pep::Result<()> {
+/// use pep::Attempt;
+/// // Reads and writes use the SAME driver — the closure picks the verb.
+/// let body: String = pep::with_token_retry(provider, |token| {
+///     let token = token.clone();
+///     async move {
+///         let resp = reqwest::Client::new()
+///             .post("https://pdt.example/api/messages")
+///             .bearer_auth(&token)
+///             .send()
+///             .await
+///             .map_err(|e| Attempt::Failed(pep::PepError::Internal(e.into())));
+///         match resp {
+///             Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => Attempt::StaleToken,
+///             Ok(r) => r.text().await
+///                 .map(Attempt::Served)
+///                 .unwrap_or_else(|e| Attempt::Failed(pep::PepError::Internal(e.into()))),
+///             Err(already_an_attempt) => already_an_attempt,
+///         }
+///     }
+/// }).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn with_token_retry<P, T, F, Fut>(provider: &P, mut attempt: F) -> Result<T>
+where
+    P: TokenProvider,
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Attempt<T>>,
+{
+    let token = provider.get_token().await?;
+    match attempt(token).await {
+        Attempt::Served(served) => Ok(served),
+        Attempt::Failed(e) => Err(e),
+        Attempt::StaleToken => {
+            // 401: the cached token was rejected. Kill the cache, re-mint,
+            // retry exactly once.
+            provider.invalidate().await;
+            let fresh = provider.get_token().await?;
+            match attempt(fresh).await {
+                Attempt::Served(served) => Ok(served),
+                Attempt::Failed(e) => Err(e),
+                Attempt::StaleToken => Err(PepError::AuthDegraded {
+                    detail: "401 persisted after token re-mint and single retry: \
+                             the credential itself is rejected, not stale"
+                        .to_string(),
+                    retryable: false,
+                }),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -839,6 +1018,45 @@ mod tests {
         };
         let cached = CachedToken::from_response(&response);
         assert!(!cached.is_valid());
+    }
+
+    // -- real-exp audit (order payam ece49472 clause 3; nghr 849e7528) -------
+
+    #[test]
+    fn compute_expires_at_from_jwt_honors_real_exp() {
+        let exp = now_epoch() + 321;
+        let jwt = jwt_with_exp(exp);
+        let ts = compute_expires_at_from_jwt(&jwt, Some(900));
+        // Re-derive: the RFC-3339 string must decode back to `exp`, not
+        // now+900 (the estimate the old code stored).
+        let parsed = parse_rfc3339_pub(&ts);
+        assert!(parsed.abs_diff(exp) <= 1, "got {ts} for exp {exp}");
+    }
+
+    #[test]
+    fn compute_expires_at_from_jwt_falls_back_without_exp() {
+        let before = now_epoch();
+        let ts = compute_expires_at_from_jwt("not-a-jwt", Some(300));
+        let parsed = parse_rfc3339_pub(&ts);
+        assert!(parsed >= before + 299 && parsed <= before + 301);
+    }
+
+    /// Minimal RFC-3339 (Zulu) parser for tests: `YYYY-MM-DDTHH:MM:SSZ`.
+    fn parse_rfc3339_pub(ts: &str) -> u64 {
+        let (date, time) = ts.split_once('T').unwrap();
+        let date = date.trim_end_matches('Z');
+        let ymd: Vec<u64> = date.split('-').map(|p| p.parse().unwrap()).collect();
+        let hms: Vec<u64> = time.trim_end_matches('Z').split(':').map(|p| p.parse().unwrap()).collect();
+        // days-from-civil (proleptic Gregorian), inverse of epoch_to_civil
+        let (y, m, d) = (ymd[0] as i64, ymd[1] as i64, ymd[2] as i64);
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = if m > 2 { m - 3 } else { m + 9 } as i64;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146097 + doe - 719468;
+        (days as u64) * 86400 + hms[0] * 3600 + hms[1] * 60 + hms[2]
     }
 
     // -- TokenProvider::invalidate (nghr 849e7528) ---------------------------
