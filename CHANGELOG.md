@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.5.10 — 2026-10-20
+
+### Added
+
+- **OWN-TOKEN ENRICHMENT COMPOSITION (nghr 9ee826c2; owner FIX ORDER payam
+  8e50cbca, 2026-10-20)**: new
+  `ResourceServerClient::enrich_claims_with_userinfo_own_token(provider,
+  claims, issuer_url, userinfo_url_override)` (feature `token-provider`) for
+  the enrichment leg of tokens the service minted ITSELF (RFC 8693
+  service-account flows). On userinfo **400/401**: invalidate the provider →
+  re-mint → **validate the fresh credential with a second userinfo roundtrip
+  before the caller proceeds** → retry once → on a second rejection, surface
+  `AuthDegraded { retryable: false }` carrying the upstream rejection body.
+  Rationale: re-mint alone was proven insufficient — during the 2026-10-20
+  payam write-leg outage, eight fresh ~900s tokens were rejected within ~40ms
+  of mint and the SAME generation succeeded 69s later with no new mint
+  (journal 711f2688: a bounded upstream validation window). A fresh-valid
+  token rejected at the store leg therefore surfaces UPSTREAM-degraded
+  (terminal loud), never a burned send, never silent success. 5xx/429/
+  transport failures are not token rejections: no re-mint on either leg;
+  they surface retryable (503-class) as before.
+
+### Compatibility (semver ruling, checklist v2 step 3)
+
+- **0.5.10 is PATCH-CLASS for pinned consumers** (same ruling as 0.5.8/0.5.9):
+  consumers pin `pep = "0.5"` and adopt by bump. The new method is purely
+  additive; `PepError` remains `#[non_exhaustive]`; the existing
+  `enrich_claims_with_userinfo` (foreign-token path) is BYTE-IDENTICAL in
+  behavior — its tests pass unchanged, and the old API gained no retry or
+  re-mint behavior. Existing callers change nothing; services that mint
+  their own tokens adopt the composition by calling the new method.
+
 ## 0.5.9 — 2026-10-19
 
 ### Added

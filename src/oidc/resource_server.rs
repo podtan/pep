@@ -562,6 +562,205 @@ impl ResourceServerClient {
 
         Ok(())
     }
+
+    /// Own-token claims enrichment (nghr 9ee826c2; owner FIX ORDER payam
+    /// 8e50cbca, 2026-10-20): the enrichment leg for a token this service
+    /// minted ITSELF (RFC 8693 service-account flows).
+    ///
+    /// Why it exists: [`Self::enrich_claims_with_userinfo`] treats a userinfo
+    /// 400/401 as terminal for the presented token — correct for a FOREIGN
+    /// bearer, wrong when the bearer came from our own provider: the cached
+    /// token can be IdP-expired despite local freshness, and the caller
+    /// deserves a re-mint, not a deny.
+    ///
+    /// The composition, exactly as ordered:
+    ///
+    ///   userinfo 400/401 ⇒ `provider.invalidate()` → re-mint →
+    ///   VALIDATE the fresh credential with a second userinfo roundtrip
+    ///   → retry once → on a second rejection: terminal loud.
+    ///
+    /// Re-mint alone is INSUFFICIENT: during the 2026-10-20 payam write-leg
+    /// outage, eight fresh ~900s tokens were rejected within ~40ms of mint,
+    /// and the SAME generation succeeded 69s later with no new mint (journal
+    /// 711f2688 — a bounded upstream validation window). Therefore the fresh
+    /// token is validated BEFORE the caller may proceed: if userinfo rejects
+    /// a just-minted token, the defect is UPSTREAM and this surfaces as
+    /// `PepError::AuthDegraded { retryable: false }` carrying the upstream
+    /// rejection body. The caller must never burn the real operation on an
+    /// unvalidated credential, and silent success is structurally impossible.
+    ///
+    /// 5xx/429/transport/malformed failures are NOT token rejections: no
+    /// re-mint on either leg; they surface retryable (503-class) with the
+    /// established classification. Other 4xx stay terminal, as before.
+    ///
+    /// Foreign-token semantics: [`Self::enrich_claims_with_userinfo`] is
+    /// untouched — separate function, no behavior change for `pep = "0.5"`
+    /// pins; consumers adopt the composition by bumping and calling this.
+    #[cfg(feature = "token-provider")]
+    pub async fn enrich_claims_with_userinfo_own_token<
+        P: crate::token_provider::TokenProvider,
+    >(
+        &self,
+        provider: &P,
+        claims: &mut JwtClaims,
+        issuer_url: &str,
+        userinfo_url_override: Option<&str>,
+    ) -> Result<()> {
+        // Fast path: identical policy to the foreign-token method.
+        let has_groups = claims.extra.contains_key("groups");
+        if has_groups {
+            tracing::debug!("Claims already contain groups — skipping userinfo enrichment");
+            return Ok(());
+        }
+
+        // Cache: identical policy (jti → sub fallback, TTL = token expiry).
+        let cache_key = claims
+            .extra
+            .get("jti")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| claims.sub.clone());
+        if let Some(cached_claims) = self.userinfo_cache.get(&cache_key).await {
+            tracing::debug!(cache_key = %cache_key, "Using cached userinfo for claims enrichment");
+            merge_userinfo_into_claims(claims, &cached_claims);
+            return Ok(());
+        }
+
+        // Resolve the userinfo endpoint (identical policy).
+        let userinfo_url = match userinfo_url_override {
+            Some(url) => url.to_string(),
+            None => match self.get_discovery_document(issuer_url).await {
+                Ok(doc) if doc.userinfo_endpoint.is_some() => {
+                    doc.userinfo_endpoint.unwrap()
+                }
+                Ok(_) => format!("{}/userinfo", issuer_url.trim_end_matches('/')),
+                Err(e) => {
+                    tracing::warn!("Failed to fetch discovery for userinfo URL: {}. Deriving from issuer.", e);
+                    format!("{}/userinfo", issuer_url.trim_end_matches('/'))
+                }
+            },
+        };
+
+        // Leg 1: mint + call.
+        let token = provider.get_token().await?;
+        match userinfo_once(&self.http_client, &userinfo_url, &token).await {
+            Ok(userinfo) => {
+                self.userinfo_cache.insert(cache_key, userinfo.clone(), claims.exp).await;
+                merge_userinfo_into_claims(claims, &userinfo);
+                Ok(())
+            }
+            // The incident wire: our OWN bearer was rejected. Invalidate,
+            // re-mint, and make the retry double as the fresh-credential
+            // validation gate.
+            Err(UserinfoFailure::TokenRejected { status, body }) => {
+                tracing::warn!(
+                    userinfo_url = %userinfo_url, status, upstream_body = %body,
+                    "own-token userinfo rejected the bearer — invalidating, re-minting, validating fresh token (9ee826c2 composition)"
+                );
+                provider.invalidate().await;
+                let fresh = provider.get_token().await?;
+                match userinfo_once(&self.http_client, &userinfo_url, &fresh).await {
+                    Ok(userinfo) => {
+                        tracing::info!(
+                            userinfo_url = %userinfo_url,
+                            "own-token enrichment: fresh credential validated — proceeding"
+                        );
+                        self.userinfo_cache.insert(cache_key, userinfo.clone(), claims.exp).await;
+                        merge_userinfo_into_claims(claims, &userinfo);
+                        Ok(())
+                    }
+                    // Fresh token rejected too → the upstream validation
+                    // state is the defect (711f2688 class). Terminal loud;
+                    // the caller must NOT proceed and burn the operation.
+                    Err(UserinfoFailure::TokenRejected { status, body }) => {
+                        tracing::error!(
+                            userinfo_url = %userinfo_url, status,
+                            "own-token userinfo rejected a JUST-MINTED token — bounded upstream window; surfacing terminal upstream-degraded"
+                        );
+                        Err(PepError::AuthDegraded {
+                            detail: format!(
+                                "own-token userinfo rejected a JUST-MINTED token after re-mint \
+                                 (upstream validation window, not a stale credential): \
+                                 HTTP {status} for {userinfo_url}; upstream body: {body}"
+                            ),
+                            retryable: false,
+                        })
+                    }
+                    Err(UserinfoFailure::Surfaced { detail, retryable }) => {
+                        Err(PepError::AuthDegraded { detail, retryable })
+                    }
+                }
+            }
+            // Transient upstream (5xx/429/transport/malformed) or other 4xx:
+            // not a token rejection — surface with the established
+            // classification, no re-mint (foreign-token semantics preserved).
+            Err(UserinfoFailure::Surfaced { detail, retryable }) => {
+                Err(PepError::AuthDegraded { detail, retryable })
+            }
+        }
+    }
+}
+
+/// One userinfo roundtrip, classified for the own-token composition
+/// ([`ResourceServerClient::enrich_claims_with_userinfo_own_token`]).
+///
+/// `TokenRejected` = HTTP 400/401: the IdP says THIS bearer is invalid — the
+/// only statuses that justify a re-mint ("400/401 on own-token enrichment",
+/// order 8e50cbca). `Surfaced` = everything else, with the established
+/// retryable classification (5xx/429/transport/malformed → `true`; other
+/// 4xx → `false`). Rejection bodies are carried (truncated to
+/// [`MAX_USERINFO_BODY_SNIPPET`] chars) so the next occurrence
+/// self-describes.
+enum UserinfoFailure {
+    TokenRejected { status: u16, body: String },
+    Surfaced { detail: String, retryable: bool },
+}
+
+const MAX_USERINFO_BODY_SNIPPET: usize = 200;
+
+async fn userinfo_once(
+    client: &Client,
+    userinfo_url: &str,
+    token: &str,
+) -> std::result::Result<serde_json::Map<String, serde_json::Value>, UserinfoFailure> {
+    let response = client
+        .get(userinfo_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .map_err(|e| UserinfoFailure::Surfaced {
+            detail: format!("userinfo request failed ({}): {}", userinfo_url, e),
+            retryable: true,
+        })?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let snippet: String = body_text.chars().take(MAX_USERINFO_BODY_SNIPPET).collect();
+        if status.as_u16() == 400 || status.as_u16() == 401 {
+            return Err(UserinfoFailure::TokenRejected {
+                status: status.as_u16(),
+                body: snippet,
+            });
+        }
+        let retryable = status.is_server_error() || status.as_u16() == 429;
+        return Err(UserinfoFailure::Surfaced {
+            detail: format!(
+                "userinfo returned HTTP {} for {}; upstream body: {}",
+                status, userinfo_url, snippet
+            ),
+            retryable,
+        });
+    }
+
+    response
+        .json()
+        .await
+        .map_err(|e| UserinfoFailure::Surfaced {
+            detail: format!("userinfo response malformed: {}", e),
+            retryable: true,
+        })
 }
 
 /// Merge select fields from the userinfo endpoint response into JWT claims `extra`.
