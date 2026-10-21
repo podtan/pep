@@ -500,3 +500,66 @@ fn parse_rfc3339(ts: &str) -> u64 {
     let days = era * 146097 + doe - 719468;
     days as u64 * 86400 + hms[0] * 3600 + hms[1] * 60 + hms[2]
 }
+
+// ---------------------------------------------------------------------------
+// 0.5.11 — single-flight mint (task 0b5df97e B3, S3 contract 2a4e7402):
+// an N-way concurrent 401 storm must collapse into exactly ONE IdP exchange
+// ---------------------------------------------------------------------------
+
+/// 8-way concurrent `get_token` on an EMPTY cache: the mint gate serializes
+/// the slow path and re-checks the cache after acquiring it, so exactly one
+/// caller exchanges and the rest serve the freshly installed token.
+#[tokio::test]
+async fn storm_on_empty_cache_mints_exactly_once() {
+    let idp = MockIdp::spawn(300).await;
+    let provider = std::sync::Arc::new(svc_provider(&idp));
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let p = provider.clone();
+        handles.push(tokio::spawn(async move { p.get_token().await.unwrap() }));
+    }
+    let mut tokens = Vec::new();
+    for h in handles {
+        tokens.push(h.await.unwrap());
+    }
+
+    assert!(
+        tokens.iter().all(|t| t == &tokens[0]),
+        "every storm caller must be served the same fresh token"
+    );
+    assert_eq!(
+        idp.exchange_count(),
+        1,
+        "8-way storm on an empty cache must collapse to ONE mint"
+    );
+}
+
+/// 8-way concurrent `get_token` after `invalidate()` (the with_token_retry
+/// reflex under concurrency): the re-mint generation also collapses to a
+/// single exchange.
+#[tokio::test]
+async fn storm_after_invalidate_mints_exactly_once_per_generation() {
+    let idp = MockIdp::spawn(300).await;
+    let provider = std::sync::Arc::new(svc_provider(&idp));
+
+    // Generation 1: prime the cache with a single mint.
+    let _ = provider.get_token().await.unwrap();
+    assert_eq!(idp.exchange_count(), 1);
+
+    // Invalidate, then storm the reactive path.
+    provider.invalidate().await;
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let p = provider.clone();
+        handles.push(tokio::spawn(async move { p.get_token().await.unwrap() }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    assert_eq!(
+        idp.exchange_count(),
+        2,
+        "post-invalidate storm must collapse to ONE re-mint (total 2 across generations)"
+    );
+}

@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing;
 
 use crate::error::{PepError, Result};
@@ -185,6 +185,12 @@ pub struct ServiceAccountTokenProvider {
     oidc_client: OidcClient,
     config: ServiceAccountConfig,
     cache: Arc<RwLock<Option<CachedToken>>>,
+    /// Single-flight mint gate (S3 client contract 2a4e7402, approved
+    /// d8c835e9; storm acceptance case): concurrent slow-path callers queue
+    /// here; the cache is re-checked after acquiring the gate, so an N-way
+    /// 401 storm collapses into exactly ONE IdP exchange and a reactive
+    /// re-mint can no longer double-mint against the proactive refresher.
+    mint_gate: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for ServiceAccountTokenProvider {
@@ -216,6 +222,7 @@ impl ServiceAccountTokenProvider {
             oidc_client: OidcClient::new(),
             config,
             cache: Arc::new(RwLock::new(None)),
+            mint_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -226,6 +233,7 @@ impl ServiceAccountTokenProvider {
             oidc_client,
             config,
             cache: Arc::new(RwLock::new(None)),
+            mint_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -249,18 +257,54 @@ impl ServiceAccountTokenProvider {
             .await?;
 
         tracing::info!(
-            "Token exchange successful, expires_in={:?}s",
-            response.expires_in
+            audience = %self.config.audience,
+            expires_in = ?response.expires_in,
+            "pep: token exchange successful (per-mint journal)"
         );
 
         Ok(CachedToken::from_response(&response))
     }
 
     /// Exchange a fresh token and install it in the cache.
+    ///
+    /// Single-flight (S3 client contract 2a4e7402, CPO-approved; storm
+    /// acceptance case: an N-way concurrent 401 storm must produce exactly
+    /// ONE IdP exchange): every exchange takes the mint gate, and the cache
+    /// is re-checked after acquiring it — a caller that queued behind an
+    /// in-flight mint serves the freshly installed token instead of minting
+    /// again. This also collapses a reactive re-mint racing the proactive
+    /// refresher into a single exchange.
     async fn refresh_cache(&self) -> Result<()> {
-        let cached = self.exchange().await?;
-        *self.cache.write().await = Some(cached);
-        Ok(())
+        let _mint = self.mint_gate.lock().await;
+        {
+            let cache = self.cache.read().await;
+            if let Some(cached) = cache.as_ref() {
+                if cached.seconds_remaining() > Self::PROACTIVE_REFRESH_SECS {
+                    tracing::debug!(
+                        audience = %self.config.audience,
+                        "pep: mint gate acquired after a concurrent refresh; serving the fresh cache"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+        match self.exchange().await {
+            Ok(cached) => {
+                *self.cache.write().await = Some(cached);
+                Ok(())
+            }
+            Err(e) => {
+                // S3 review note 1: per-mint journaling is normative,
+                // failures included. Reactive-path failures previously
+                // surfaced only to the caller — ops saw nothing.
+                tracing::warn!(
+                    audience = %self.config.audience,
+                    error = %e,
+                    "pep: token exchange failed (reactive mint)"
+                );
+                Err(e)
+            }
+        }
     }
 
     /// Spawn a background task that keeps the cache fresh proactively: it

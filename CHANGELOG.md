@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.11 — 2026-10-21
+
+**Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump —
+the internal gate adds no public surface; `Attempt`/`with_token_retry`/
+`invalidate` semantics are untouched and `PepError` remains `#[non_exhaustive]`).
+
+Task 0b5df97e leg B3 — reconciliation of the token lifecycle against the
+approved S3 TokenProvider client contract (doc 2a4e7402, review-cleared
+d8c835e9: "the reflex contract is cleared for implementation"). Budget-of-one,
+403-never-retried, and double-401-terminal were already pinned in 0.5.9/0.5.10;
+this release closes the two deltas the reconciliation found:
+
+- **Single-flight mint (S3 acceptance case: an N-way concurrent 401 storm
+  must produce exactly ONE IdP exchange).** All exchanges now take a mint
+  gate and re-check the cache after acquiring it: callers that queue behind
+  an in-flight mint serve the freshly installed token instead of minting
+  again. A reactive re-mint racing the proactive refresher collapses the
+  same way.
+- **Per-mint journaling made normative (S3 review note 1 — "make per-refresh
+  journaling normative in the crate … the silent-mint was half of how
+  b82a1925 hid").** The mint success line now carries audience + expires_in,
+  and reactive-path exchange failures journal a WARN (previously only the
+  proactive refresher warned; reactive failures surfaced to the caller
+  alone, leaving ops nothing).
+
+Storm regression pins added to `tests/token_hardening.rs`: 8-way concurrent
+`get_token` on an empty cache and on a just-invalidated cache each collapse
+to exactly one exchange, with every caller served the same fresh token.
+
 ## 0.5.10 — 2026-10-20
 
 ### Added
