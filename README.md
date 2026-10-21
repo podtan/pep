@@ -34,23 +34,37 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 # Full OIDC support (client + resource server)
-pep = { version = "0.1", features = ["oidc"] }
+pep = { version = "0.5", features = ["oidc"] }
 
 # Or enable specific features
-pep = { version = "0.1", features = ["oidc-resource-server"] }
+pep = { version = "0.5", features = ["oidc-resource-server"] }
 
 # With Axum integration (requires axum 0.8+)
-pep = { version = "0.1", features = ["oidc-resource-server", "axum"] }
+pep = { version = "0.5", features = ["oidc-resource-server", "axum"] }
 
 # With configuration file parsing support
-pep = { version = "0.1", features = ["oidc", "config"] }
+pep = { version = "0.5", features = ["oidc", "config"] }
 
 # With RFC 9728 Protected Resource Metadata
-pep = { version = "0.1", features = ["rfc9728"] }
+pep = { version = "0.5", features = ["rfc9728"] }
 
 # Full-featured
-pep = { version = "0.1", features = ["oidc", "axum", "config", "rfc9728"] }
+pep = { version = "0.5", features = ["oidc", "axum", "config", "rfc9728"] }
 ```
+
+## Versioning & Pin Support
+
+**Pin `pep = "0.5"`.** The 0.5 line is patch-compatible: security fixes and
+behavioral hardening ship as patch releases (0.5.x) and pinned consumers adopt
+them with a plain `cargo update` — no code changes, no coordinated cutover.
+Additive API surface has been ruled patch-class when it does not break existing
+call sites (see CHANGELOG rulings for 0.5.8, 0.5.9, 0.5.10). `PepError` is
+`#[non_exhaustive]`: never exhaustive-match on it. Breaking changes, if ever
+needed, bump the minor line (0.6) — never inside 0.5.x.
+
+This statement is the standing contract that retires the two-pep-skew class
+(trustee 199c4801: divergent pep versions in one tree because pin guidance was
+absent or stale). Keep this section current with every release ruling.
 
 ## Usage
 
