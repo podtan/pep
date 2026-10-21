@@ -118,6 +118,12 @@ pub mod token_store;
 #[cfg(feature = "token-provider")]
 pub mod oauth_callback;
 
+// PDT-backed roles resolver (task 4c57b9c5, IdP decouple): roles as PDT
+// data keyed by the validated sub, groups claims demoted to optional
+// hints. Rides the token-provider feature seam beside the token lifecycle.
+#[cfg(feature = "token-provider")]
+pub mod roles;
+
 // Re-export token provider types
 #[cfg(feature = "token-provider")]
 pub use token_provider::{
@@ -126,6 +132,10 @@ pub use token_provider::{
     InteractiveConfig, InteractiveTokenProvider,
     Attempt, with_token_retry,
 };
+
+// Re-export PDT roles resolver types
+#[cfg(feature = "token-provider")]
+pub use roles::{PdtRoles, PdtRolesClient, PdtRolesError, WorkspaceMembership, DEFAULT_ROLES_TTL};
 
 // Re-export token store types
 #[cfg(feature = "token-provider")]

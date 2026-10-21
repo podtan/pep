@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.5.12 — 2026-10-21
+
+**Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump —
+the new surface is additive behind the existing optional `token-provider`
+feature, `PepError` remains `#[non_exhaustive]`, and no existing type, trait,
+or function changes shape or semantics).
+
+Task 4c57b9c5 (workstream ffe7f9cc, IdP decouple) — **PDT-backed roles
+resolver: drop the groups-claim dependency.** Kanidm 1.11.0's service-account
+claim projection is broken upstream (nghr 6c8efe55), so token `groups`
+claims are demoted to optional hints: authorization data becomes PDT roles
+keyed by the validated token's stable `sub` (spec of record PDT 2fea489c;
+binding consumer contract thread beb8041d).
+
+- New module `pep::roles` (feature `token-provider`): `PdtRolesClient`
+  resolves `GET {base}/api/roles/{sub}` — ONE sub-keyed query returning
+  both role families (workspace membership + user global role), with a
+  short-TTL per-sub cache (30s default, `with_ttl` tunable, `invalidate`
+  for explicit revocation).
+- **Roles are opaque strings**: `PdtRoles` / `WorkspaceMembership` carry
+  the PDT vocabulary verbatim; the resolver never inspects role content.
+- **Empty ≠ unreachable**: 200-with-defaults (known or unknown sub, zero
+  roles) is an authoritative least-privilege `Ok` — "authorize nothing",
+  not an error. Only transport failure / timeout / 5xx / contract-violating
+  answers are `PdtRolesError::Unreachable`, the fail-closed arm: consumers
+  MUST deny on it, never fail open. A 404 from a non-conforming PDT is
+  journaled and treated as least-privilege empty (deny-by-empty), since
+  retrying cannot change an authoritative empty.
+- **Foreign-authority guard**: an answer whose `sub` differs from the
+  requested one is refused (`Unreachable`) — a misbehaving PDT can never
+  bind another principal's roles.
+- **No groups-claim read anywhere in the path**: the input is the validated
+  JWT's `sub` alone. Wire-pinned in `tests/pdt_roles.rs` (signed JWT with
+  NO groups claim authorizes from PDT roles alone; PDT-down = deny;
+  200-defaults = least privilege; TTL cache single-upstream-hit; 500 and
+  sub-mismatch = Unreachable; path-escape subs rejected pre-wire).
+
+Cedar policy cutover onto this resolver is tracked separately (nghr
+2e45619e); this release ships the resolution seam and pins its contract.
+
 ## 0.5.11 — 2026-10-21
 
 **Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump —
