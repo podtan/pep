@@ -55,6 +55,9 @@ struct MockIdp {
     fail_tokens: Arc<AtomicBool>,
     /// Lifetime of minted tokens (seconds from now).
     lifetime: Arc<AtomicU64>,
+    /// When set, POST /token serves EXACTLY this token (identical-re-mint
+    /// injection — IdP-side grant dedupe, 0.5.13).
+    canned: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl MockIdp {
@@ -67,10 +70,12 @@ impl MockIdp {
         let exchanges = Arc::new(AtomicUsize::new(0));
         let fail_tokens = Arc::new(AtomicBool::new(false));
         let lifetime = Arc::new(AtomicU64::new(lifetime_secs));
+        let canned = Arc::new(std::sync::RwLock::new(None::<String>));
 
         let exchanges_task = exchanges.clone();
         let fail_task = fail_tokens.clone();
         let lifetime_task = lifetime.clone();
+        let canned_task = canned.clone();
         tokio::spawn(async move {
             loop {
                 let (mut sock, _) = match listener.accept().await {
@@ -80,6 +85,7 @@ impl MockIdp {
                 let exchanges = exchanges_task.clone();
                 let fail = fail_task.clone();
                 let lifetime = lifetime_task.clone();
+                let canned = canned_task.clone();
                 tokio::spawn(async move {
                     // Accumulate chunks — a single read can split headers,
                     // and re-reading into the same buffer would clobber the
@@ -117,7 +123,9 @@ impl MockIdp {
                             return;
                         }
                         let jti = exchanges.load(Ordering::SeqCst) - 1;
-                        let jwt = mint_jwt(lifetime.load(Ordering::SeqCst), jti);
+                        let jwt = canned.read().unwrap().clone().unwrap_or_else(|| {
+                            mint_jwt(lifetime.load(Ordering::SeqCst), jti)
+                        });
                         let content = format!(
                             r#"{{"access_token":"{jwt}","token_type":"Bearer","expires_in":900}}"#
                         );
@@ -137,11 +145,17 @@ impl MockIdp {
             }
         });
 
-        Self { issuer, exchanges, fail_tokens, lifetime }
+        Self { issuer, exchanges, fail_tokens, lifetime, canned }
     }
 
     fn exchange_count(&self) -> usize {
         self.exchanges.load(Ordering::SeqCst)
+    }
+
+    /// When `Some(t)`, every /token exchange serves EXACTLY `t` — the IdP
+    /// grant-dedupe wire (re-mint returns the identical rejected token).
+    fn serve_canned_token(&self, t: Option<String>) {
+        *self.canned.write().unwrap() = t;
     }
 
     /// Change the lifetime of subsequently minted tokens (seconds from now).
@@ -366,6 +380,46 @@ async fn double_401_is_terminal_auth_degraded() {
     assert!(err.is_auth_degraded(), "double-401 must be AuthDegraded");
     assert!(!err.retryable(), "credential rejected ≠ retryable");
     assert_eq!(attempts.load(Ordering::SeqCst), 2, "retry is bounded at one");
+}
+
+/// 0.5.13: re-mint returning the IDENTICAL rejected token (IdP grant-dedupe
+/// wire) must produce a terminal AuthDegraded whose detail NAMES the
+/// deterministic rejection instead of the generic "credential rejected" —
+/// so callers stop concluding the token lifecycle is broken and looping
+/// retries against a re-mint that can never help.
+#[tokio::test]
+async fn double_401_after_identical_re_mint_names_the_deterministic_rejection() {
+    let idp = MockIdp::spawn(900).await;
+    // IdP serves the exact same token on every exchange (grant dedupe).
+    idp.serve_canned_token(Some(mint_jwt(900, 7)));
+    let provider = svc_provider(&idp);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_w = attempts.clone();
+    let err = with_token_retry(&provider, move |_| {
+        let attempts = attempts_w.clone();
+        async move {
+            let n = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            assert!(n <= 2, "budget-of-one violated: attempt {n} after terminal 401");
+            Attempt::<String>::StaleToken
+        }
+    })
+    .await
+    .unwrap_err();
+
+    assert!(err.is_auth_degraded());
+    assert!(!err.retryable(), "deterministic rejection must not be retryable");
+    let detail = format!("{err}");
+    assert!(
+        detail.contains("IDENTICAL"),
+        "terminal detail must name the identical re-mint: {detail}"
+    );
+    assert!(
+        detail.contains("NOT the fault"),
+        "terminal detail must exonerate the token lifecycle: {detail}"
+    );
+    assert_eq!(idp.exchange_count(), 2, "exactly one real re-mint");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "retry still bounded at one");
 }
 
 /// Non-401 failures pass through untouched and are never retried.

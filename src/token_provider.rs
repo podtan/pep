@@ -256,13 +256,36 @@ impl ServiceAccountTokenProvider {
             )
             .await?;
 
+        let cached = CachedToken::from_response(&response);
+        // 0.5.13 mint journal: fingerprint (NEVER the token itself) + jti +
+        // real remaining life, so 401 windows can be correlated across
+        // surfaces by token identity. A fresh token born at/below the serve
+        // threshold is the clock-skew signature (IdP/resource-server clock
+        // ahead of this host) — the exact class behind recurring
+        // "self-recovering" 401 windows on PDT surfaces.
+        let secs = cached.seconds_remaining();
+        let fp = token_fingerprint(&response.access_token);
+        let jti = jwt_jti(&response.access_token).unwrap_or_else(|| "opaque".to_string());
+        if secs <= Self::PROACTIVE_REFRESH_SECS {
+            tracing::warn!(
+                audience = %self.config.audience,
+                jti = %jti,
+                fp = %fp,
+                seconds_remaining = secs,
+                "pep: FRESH token born at/below the serve threshold — clock skew (IdP vs this \
+                 host) or a short-lived grant; expect upstream 401s until clocks converge"
+            );
+        }
         tracing::info!(
             audience = %self.config.audience,
+            jti = %jti,
+            fp = %fp,
             expires_in = ?response.expires_in,
-            "pep: token exchange successful (per-mint journal)"
+            seconds_remaining = secs,
+            "pep: token minted (per-mint journal fingerprint)"
         );
 
-        Ok(CachedToken::from_response(&response))
+        Ok(cached)
     }
 
     /// Exchange a fresh token and install it in the cache.
@@ -613,6 +636,11 @@ pub(crate) fn compute_expires_at(expires_in: Option<u64>) -> String {
 /// tokens without an `exp` claim. Single decode path shared by
 /// [`CachedToken::from_response`] and [`compute_expires_at_from_jwt`].
 fn jwt_exp_epoch(access_token: &str) -> Option<u64> {
+    jwt_payload(access_token)?.get("exp")?.as_u64()
+}
+
+/// Decode the JWT payload (middle segment) into JSON, if the token is a JWT.
+fn jwt_payload(access_token: &str) -> Option<serde_json::Value> {
     // JWT structure: header.payload.signature — we only need the payload
     let parts: Vec<&str> = access_token.split('.').collect();
     if parts.len() < 2 {
@@ -631,12 +659,27 @@ fn jwt_exp_epoch(access_token: &str) -> Option<u64> {
         }
     };
 
-    let payload_json: serde_json::Value = match serde_json::from_slice(&payload) {
-        Ok(v) => v,
-        Err(_) => return None,
-    };
+    serde_json::from_slice(&payload).ok()
+}
 
-    payload_json.get("exp").and_then(|v| v.as_u64())
+/// Extract the `jti` claim from a JWT access token (mint journaling, 0.5.13).
+fn jwt_jti(access_token: &str) -> Option<String> {
+    jwt_payload(access_token)?
+        .get("jti")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// Short NON-SENSITIVE fingerprint of a token for journaling (0.5.13):
+/// first 12 hex chars of SHA-256. NEVER log the token itself.
+fn token_fingerprint(access_token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(access_token.as_bytes());
+    digest
+        .iter()
+        .take(6)
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
 }
 
 /// Compute expiry from the actual JWT `exp` claim.
@@ -768,28 +811,51 @@ where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Attempt<T>>,
 {
-    let token = provider.get_token().await?;
-    match attempt(token).await {
-        Attempt::Served(served) => Ok(served),
-        Attempt::Failed(e) => Err(e),
-        Attempt::StaleToken => {
-            // 401: the cached token was rejected. Kill the cache, re-mint,
-            // retry exactly once.
-            provider.invalidate().await;
-            let fresh = provider.get_token().await?;
-            match attempt(fresh).await {
-                Attempt::Served(served) => Ok(served),
-                Attempt::Failed(e) => Err(e),
-                Attempt::StaleToken => Err(PepError::AuthDegraded {
-                    detail: "401 persisted after token re-mint and single retry: \
+        let token = provider.get_token().await?;
+        match attempt(token.clone()).await {
+            Attempt::Served(served) => Ok(served),
+            Attempt::Failed(e) => Err(e),
+            Attempt::StaleToken => {
+                // 401: the cached token was rejected. Kill the cache, re-mint,
+                // retry exactly once.
+                provider.invalidate().await;
+                let fresh = provider.get_token().await?;
+                // 0.5.13: identity check. If the IdP re-issued the SAME token
+                // that was just rejected, the rejection is deterministic
+                // (clock skew, revoked credential, or a server-side JWKS
+                // rotation window): the retry cannot change the outcome, and
+                // the terminal error must say so instead of letting callers
+                // conclude the token lifecycle is broken and loop retries.
+                let identical = fresh == token;
+                if identical {
+                    tracing::warn!(
+                        "pep: re-mint returned the IDENTICAL token that was just rejected — \
+                         deterministic rejection (clock skew / revoked credential / server-side \
+                         JWKS rotation window); token lifecycle is not the fault"
+                    );
+                }
+                match attempt(fresh).await {
+                    Attempt::Served(served) => Ok(served),
+                    Attempt::Failed(e) => Err(e),
+                    Attempt::StaleToken => Err(PepError::AuthDegraded {
+                        detail: if identical {
+                            "401 persisted after token re-mint and single retry; the re-mint \
+                             returned the IDENTICAL token — deterministic rejection (IdP/host \
+                             clock skew, revoked subject credential, or a server-side JWKS \
+                             rotation window). The token lifecycle is NOT the fault: check the \
+                             resource server / IdP side; do not loop retries."
+                                .to_string()
+                        } else {
+                            "401 persisted after token re-mint and single retry: \
                              the credential itself is rejected, not stale"
-                        .to_string(),
-                    retryable: false,
-                }),
+                                .to_string()
+                        },
+                        retryable: false,
+                    }),
+                }
             }
         }
     }
-}
 
 // ---------------------------------------------------------------------------
 // TokenProviderEnum — enum dispatch

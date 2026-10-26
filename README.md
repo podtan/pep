@@ -58,7 +58,7 @@ pep = { version = "0.5", features = ["oidc", "axum", "config", "rfc9728"] }
 behavioral hardening ship as patch releases (0.5.x) and pinned consumers adopt
 them with a plain `cargo update` — no code changes, no coordinated cutover.
 Additive API surface has been ruled patch-class when it does not break existing
-call sites (see CHANGELOG rulings for 0.5.8, 0.5.9, 0.5.10, 0.5.11, 0.5.12). `PepError` is
+call sites (see CHANGELOG rulings for 0.5.8 through 0.5.13). `PepError` is
 `#[non_exhaustive]`: never exhaustive-match on it. Breaking changes, if ever
 needed, bump the minor line (0.6) — never inside 0.5.x.
 

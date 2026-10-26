@@ -14,7 +14,36 @@ use super::types::{JwtClaims, OidcDiscoveryDocument, CachedJwks, CachedDiscovery
 ///
 /// Storm guard: a burst of tokens bearing unknown/random kids must not hammer
 /// the IdP's JWKS endpoint — at most one forced fetch per interval.
+///
+/// 0.5.13: the hold is now OUTCOME-SENSITIVE — a SUCCESSFUL fetch holds for
+/// this interval, but a FAILED fetch holds only for
+/// [`FORCED_REFRESH_FAIL_INTERVAL`]. One transient IdP blip must not wall the
+/// rotation path for 30 seconds while every unknown-kid token 401s.
 const FORCED_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Hold applied after a FAILED forced JWKS fetch (0.5.13).
+///
+/// A failed fetch carries no new information, but it also must not earn the
+/// full 30s hold: during IdP key rotation a single blip used to suppress all
+/// further forced refreshes for the window, producing minutes-long runs of
+/// valid tokens rejected with identical 401s (kavosh specimen 9ee826c2 class).
+const FORCED_REFRESH_FAIL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Minimum pacing between paced-bypass JWKS fetches for the same `jwks_uri`
+/// (0.5.13). When a kid is STILL missing after the guarded attempt — the IdP
+/// served a stale key set (replica lag) or the guarded fetch failed — one
+/// single-flight bypass fetch gives the request a live second chance while
+/// capping the worst-case fetch rate at ~1/s per process per uri.
+const BYPASS_PACE: Duration = Duration::from_secs(1);
+
+/// Outcome of a forced-refresh attempt (0.5.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedRefreshOutcome {
+    /// A live fetch was made (result cached, hit or miss).
+    Fetched,
+    /// The storm guard held — no live fetch; caller re-reads the cache.
+    Held,
+}
 
 /// Cache entry for userinfo endpoint responses
 #[derive(Clone)]
@@ -135,6 +164,13 @@ pub struct ResourceServerClient {
     pub userinfo_cache: Arc<UserInfoCache>,
     /// Last forced JWKS refresh per jwks_uri (storm guard for IdP key rotation)
     pub last_forced_fetch: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Guard hold per jwks_uri (0.5.13): outcome-sensitive — see
+    /// `force_refresh_jwks`. Absent ⇒ `FORCED_REFRESH_MIN_INTERVAL`.
+    pub forced_fetch_hold: Arc<RwLock<HashMap<String, Duration>>>,
+    /// Single-flight gate for the paced unknown-kid bypass fetch (0.5.13).
+    pub bypass_gate: Arc<tokio::sync::Mutex<()>>,
+    /// Last paced-bypass attempt per jwks_uri (0.5.13).
+    pub last_bypass: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl ResourceServerClient {
@@ -147,6 +183,9 @@ impl ResourceServerClient {
             discovery_cache_raw: Arc::new(RwLock::new(HashMap::new())),
             userinfo_cache: Arc::new(UserInfoCache::new()),
             last_forced_fetch: Arc::new(RwLock::new(HashMap::new())),
+            forced_fetch_hold: Arc::new(RwLock::new(HashMap::new())),
+            bypass_gate: Arc::new(tokio::sync::Mutex::new(())),
+            last_bypass: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -321,28 +360,46 @@ impl ResourceServerClient {
 
     /// Force-refresh the JWKS for `jwks_uri`, bypassing the cache TTL.
     ///
-    /// Storm-guarded: the attempt timestamp is recorded BEFORE fetching (so
-    /// failed fetches are rate-limited too), and when a forced refresh already
-    /// happened within `FORCED_REFRESH_MIN_INTERVAL`, the cached keys are
-    /// served instead of hitting the IdP again.
-    async fn force_refresh_jwks(&self, jwks_uri: &str) -> Result<HashMap<String, (DecodingKey, Algorithm)>> {
+    /// Storm-guarded (0.5.13 semantics): the attempt timestamp is recorded
+    /// BEFORE fetching (so failed fetches are rate-limited too), and a fetch
+    /// inside the guard hold for that uri is suppressed. The hold is
+    /// OUTCOME-SENSITIVE: a successful fetch holds for
+    /// `FORCED_REFRESH_MIN_INTERVAL` (30s); a FAILED fetch holds only for
+    /// `FORCED_REFRESH_FAIL_INTERVAL` (2s). Pre-0.5.13, one transient IdP
+    /// blip suppressed forced refreshes for the full 30s while every
+    /// unknown-kid token 401'd — the rotation-window defect.
+    async fn force_refresh_jwks(&self, jwks_uri: &str) -> Result<ForcedRefreshOutcome> {
         {
             let mut last = self.last_forced_fetch.write().await;
+            let mut holds = self.forced_fetch_hold.write().await;
             let now = Instant::now();
             if let Some(prev) = last.get(jwks_uri) {
-                if now.duration_since(*prev) < FORCED_REFRESH_MIN_INTERVAL {
-                    drop(last);
-                    tracing::debug!("Storm guard held for {} — serving cached JWKS instead of forced refresh", jwks_uri);
-                    let cache = self.jwks_cache.read().await;
-                    if let Some(cached) = cache.get(jwks_uri) {
-                        return Ok(cached.keys.clone());
-                    }
-                    return self.get_jwks_inner(jwks_uri, false).await;
+                let hold = holds
+                    .get(jwks_uri)
+                    .copied()
+                    .unwrap_or(FORCED_REFRESH_MIN_INTERVAL);
+                if now.duration_since(*prev) < hold {
+                    tracing::debug!(
+                        "Storm guard held for {} — serving cached JWKS instead of forced refresh",
+                        jwks_uri
+                    );
+                    return Ok(ForcedRefreshOutcome::Held);
                 }
             }
             last.insert(jwks_uri.to_string(), now);
+            // Pessimistic hold BEFORE the fetch: a failure still rate-limits,
+            // but only for the short fail interval. Overwritten below on
+            // success with the full interval.
+            holds.insert(jwks_uri.to_string(), FORCED_REFRESH_FAIL_INTERVAL);
         }
-        self.get_jwks_inner(jwks_uri, true).await
+        match self.get_jwks_inner(jwks_uri, true).await {
+            Ok(_) => {
+                let mut holds = self.forced_fetch_hold.write().await;
+                holds.insert(jwks_uri.to_string(), FORCED_REFRESH_MIN_INTERVAL);
+                Ok(ForcedRefreshOutcome::Fetched)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Validate JWT token with custom validation options
@@ -375,13 +432,94 @@ impl ResourceServerClient {
                 kid,
                 discovery_doc.jwks_uri
             );
-            if let Err(e) = self.force_refresh_jwks(&discovery_doc.jwks_uri).await {
-                tracing::warn!("Forced JWKS refresh failed for {}: {}", discovery_doc.jwks_uri, e);
-            }
+            let forced = match self.force_refresh_jwks(&discovery_doc.jwks_uri).await {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    tracing::warn!(
+                        "Forced JWKS refresh failed for {}: {}",
+                        discovery_doc.jwks_uri,
+                        e
+                    );
+                    ForcedRefreshOutcome::Held
+                }
+            };
             keys = self.get_jwks(&discovery_doc.jwks_uri).await?;
+
+            // 0.5.13: the kid is STILL missing after the guarded attempt.
+            // During IdP key rotation this is normally propagation lag (a
+            // lagging replica served the old key set) or a transient fetch
+            // failure — both heal within ~1s, not 30s. One paced, single-
+            // flight bypass fetch gives this request a live second chance
+            // without turning a random-kid flood into a fetch storm: at most
+            // one bypass per `BYPASS_PACE` per jwks_uri per process.
+            if !keys.contains_key(&kid) {
+                let _gate = self.bypass_gate.lock().await;
+                // A concurrent bypass may have healed the cache while we
+                // queued on the gate.
+                keys = self.get_jwks(&discovery_doc.jwks_uri).await?;
+                let pace_ok = {
+                    let mut last = self.last_bypass.write().await;
+                    let now = Instant::now();
+                    let allowed = last
+                        .get(&discovery_doc.jwks_uri)
+                        .map(|prev| now.duration_since(*prev) >= BYPASS_PACE)
+                        .unwrap_or(true);
+                    if allowed {
+                        last.insert(discovery_doc.jwks_uri.clone(), now);
+                    }
+                    allowed
+                };
+                if pace_ok {
+                    tracing::info!(
+                        "kid {} still missing after guarded refresh (outcome {:?}) — paced bypass fetch",
+                        kid,
+                        forced
+                    );
+                    match self.get_jwks_inner(&discovery_doc.jwks_uri, true).await {
+                        Ok(fresh) => keys = fresh,
+                        Err(e) => tracing::warn!(
+                            "Bypass JWKS fetch failed for {}: {}",
+                            discovery_doc.jwks_uri,
+                            e
+                        ),
+                    }
+                }
+            }
         }
-        let (decoding_key, key_algorithm) = keys.get(&kid)
-            .ok_or_else(|| PepError::JwtValidation(format!("No key found for kid: {}", kid)))?;
+
+        let pair = match keys.get(&kid) {
+            Some(pair) => pair,
+            None => {
+                let (n_keys, age_secs) = {
+                    let cache = self.jwks_cache.read().await;
+                    cache
+                        .get(&discovery_doc.jwks_uri)
+                        .map(|c| {
+                            (
+                                c.keys.len(),
+                                c.fetched_at
+                                    .elapsed()
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            )
+                        })
+                        .unwrap_or((0, 0))
+                };
+                tracing::warn!(
+                    kid = %kid,
+                    jwks_keys = n_keys,
+                    cache_age_secs = age_secs,
+                    "pep: unknown kid AFTER guarded refresh + paced bypass — IdP rotation \
+                     propagation lag or bogus kid; the token is likely VALID, do not re-mint"
+                );
+                return Err(PepError::JwtValidation(format!(
+                    "No key found for kid: {kid} (JWKS has {n_keys} keys, cache age {age_secs}s) \
+                     — IdP key-rotation propagation lag or bogus kid. The token is likely VALID: \
+                     do not re-mint, check IdP replica convergence."
+                )));
+            }
+        };
+        let (decoding_key, key_algorithm) = pair;
 
         // Determine which algorithm to use:
         let algorithm = {

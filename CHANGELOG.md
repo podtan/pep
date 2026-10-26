@@ -1,5 +1,54 @@
 # Changelog
 
+## 0.5.13 — 2026-10-26
+
+**Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump).
+No public type, trait, or function signature changes: `PepError` remains
+`#[non_exhaustive]`, the fix works inside the existing JWKS cache-guard
+behavior, the new `ResourceServerClient` fields are additive (consumers use
+`ResourceServerClient::new()`, never struct literals), and diagnostics are
+log fields + error-message text. Owner trigger: estate-wide recurring 401
+walls on pep-backed send paths (payam `send_message` et al.) — agents burning
+agent-level retries on sends that fail "twice with the same 401".
+
+**Root cause (server side, this fix):** during IdP key rotation, one unknown-kid
+validation armed the forced-refresh storm guard — and a FAILED forced fetch
+armed it just as hard as a successful one (30s). While the guard held, every
+request served the kidless cached JWKS, so freshly-minted VALID tokens were
+rejected with identical 401s; clients burned their single re-mint pointlessly
+and agents retried the whole operation — minutes-long self-recovering windows
+(kavosh specimen 9ee826c2: 5.5min / ~6.5min recurring; triggered by today's
+kaniop/IdP restarts). The client token lifecycle was never at fault; the
+"fix = payam seat" routing on that specimen is corrected by this release.
+
+**Fixes (server):**
+- Outcome-sensitive storm guard: a successful forced JWKS fetch holds 30s; a
+  FAILED one holds only 2s (`FORCED_REFRESH_FAIL_INTERVAL`). One transient IdP
+  blip no longer walls the rotation path.
+- Paced single-flight bypass (`BYPASS_PACE` 1s, per jwks_uri, per process):
+  when a kid is still missing after the guarded attempt — replica lag served a
+  stale key set, or the guarded fetch failed — the request gets exactly one
+  live second chance in-request instead of 30s of 401s. Storm bound evolves
+  from "1 forced fetch per 30s window" to "1 forced fetch + 1 paced bypass".
+- Unknown-kid terminal error now names the class ("No key found for kid: X
+  (JWKS has N keys, cache age Ys) — IdP key-rotation propagation lag or bogus
+  kid. The token is likely VALID: do not re-mint…") with a WARN journal, so
+  ops attributes the window in minutes and clients stop re-minting.
+
+**Hardening (client, same wire):**
+- Mint journal fingerprint: every exchange logs jti + SHA-256 prefix (never
+  the token) + real remaining life; a fresh token born at/below the serve
+  threshold logs a loud clock-skew WARN.
+- `with_token_retry`: if the re-mint returns the IDENTICAL rejected token
+  (IdP grant-dedupe), the terminal `AuthDegraded` detail names the
+  deterministic rejection (clock skew / revoked credential / server-side
+  rotation window) and states the token lifecycle is NOT the fault. Budget-of-
+  one is unchanged.
+
+**Regression tests:** failed-forced-fetch bypass heals in-request (zero 401s);
+stale-replica fetch healed by the bypass; storm bound re-anchored at 3 fetches;
+identical-re-mint terminal detail names the cause.
+
 ## 0.5.12 — 2026-10-21
 
 **Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump —
