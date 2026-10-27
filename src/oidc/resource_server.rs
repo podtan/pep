@@ -667,14 +667,32 @@ impl ResourceServerClient {
         if !response.status().is_success() {
             let status = response.status();
             let retryable = status.is_server_error() || status.as_u16() == 429;
+            // Attribution-only detail enrichment (0.5.14, CPO ruling leg 4):
+            // carry the upstream body (truncated, same rule as the 0.5.10
+            // own-token path) and, when a 400/401 body identifies the
+            // session-supersession class, name it. Classification is
+            // UNCHANGED — same AuthDegraded variant, same retryable.
+            let body_text = response.text().await.unwrap_or_default();
+            let snippet: String = body_text.chars().take(MAX_USERINFO_BODY_SNIPPET).collect();
+            let attribution = (status.as_u16() == 400 || status.as_u16() == 401)
+                .then(|| session_supersession_attribution(&body_text))
+                .flatten();
             tracing::warn!(
                 userinfo_url = %userinfo_url, status = %status, retryable,
+                upstream_body = %snippet,
                 "Userinfo endpoint returned error — surfacing auth_degraded (fail-closed)"
             );
             // 4xx (e.g. 400/401 invalid_token mid-flight): terminal for this
             // token → deny. 5xx/429: transient → retryable 503-class.
             return Err(PepError::AuthDegraded {
-                detail: format!("userinfo returned HTTP {} for {}", status, userinfo_url),
+                detail: match attribution {
+                    Some(a) => format!(
+                        "userinfo returned HTTP {status} for {userinfo_url}; upstream body: {snippet}; {a}"
+                    ),
+                    None => format!(
+                        "userinfo returned HTTP {status} for {userinfo_url}; upstream body: {snippet}"
+                    ),
+                },
                 retryable,
             });
         }
@@ -810,16 +828,21 @@ impl ResourceServerClient {
                     // Fresh token rejected too → the upstream validation
                     // state is the defect (711f2688 class). Terminal loud;
                     // the caller must NOT proceed and burn the operation.
+                    // When the body names the session-supersession class
+                    // (0.5.14), the terminal detail carries the attribution.
                     Err(UserinfoFailure::TokenRejected { status, body }) => {
                         tracing::error!(
                             userinfo_url = %userinfo_url, status,
                             "own-token userinfo rejected a JUST-MINTED token — bounded upstream window; surfacing terminal upstream-degraded"
                         );
+                        let attribution = session_supersession_attribution(&body)
+                            .map(|a| format!("; {a}"))
+                            .unwrap_or_default();
                         Err(PepError::AuthDegraded {
                             detail: format!(
                                 "own-token userinfo rejected a JUST-MINTED token after re-mint \
                                  (upstream validation window, not a stale credential): \
-                                 HTTP {status} for {userinfo_url}; upstream body: {body}"
+                                 HTTP {status} for {userinfo_url}; upstream body: {body}{attribution}"
                             ),
                             retryable: false,
                         })
@@ -837,6 +860,36 @@ impl ResourceServerClient {
             }
         }
     }
+}
+
+/// Attribution markers for the IdP single-active-grant session-supersession
+/// class (CPO ruling 2026-10-27, 595f826d fix lane leg 4).
+///
+/// The estate IdP (kanidm) removes a client's prior oauth2 session on each
+/// new token exchange ("Removing orphaned oauth2 session"); the superseded
+/// token's userinfo call then answers 400/401 while the token itself is
+/// likely VALID — a re-mint heals and the token lifecycle is not at fault.
+/// Attribution fires ONLY when the rejection body carries
+/// grant/session-invalidation vocabulary — never the generic
+/// `invalid_token`, which is the ordinary dead-bearer signal (firing on it
+/// would be a new lying class). The exact upstream rendering is ruling leg
+/// (b) (paydar's kanidm source investigation); this marker set is the
+/// tunable contract point, and every 4xx detail now carries the body
+/// snippet so the next specimen self-describes.
+const SESSION_SUPERSESSION_ERROR_CODES: &[&str] = &["invalid_grant", "invalid_session"];
+const SESSION_SUPERSESSION_SESSION_VERBS: &[&str] =
+    &["orphaned", "superseded", "removed", "revoked"];
+
+const SESSION_SUPERSESSION_ATTRIBUTION: &str = "token likely VALID: superseded by a later IdP exchange (single-active-grant session semantics); re-mint heals; token lifecycle not at fault";
+
+/// `Some(attribution)` when an IdP 400/401 body identifies the
+/// session-supersession class; `None` otherwise (detail stays unchanged).
+fn session_supersession_attribution(body: &str) -> Option<&'static str> {
+    let lower = body.to_ascii_lowercase();
+    let named = SESSION_SUPERSESSION_ERROR_CODES.iter().any(|m| lower.contains(m));
+    let compound = lower.contains("session")
+        && SESSION_SUPERSESSION_SESSION_VERBS.iter().any(|v| lower.contains(v));
+    (named || compound).then_some(SESSION_SUPERSESSION_ATTRIBUTION)
 }
 
 /// One userinfo roundtrip, classified for the own-token composition

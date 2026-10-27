@@ -309,6 +309,52 @@ async fn fresh_token_rejected_upstream_is_terminal_loud() {
     assert_eq!(idp.userinfo_count(), 2, "fresh-token validation happened — and STILL terminal");
 }
 
+/// 595f826d fix lane (CPO ruling 2026-10-27, leg 4): a SECOND-leg rejection
+/// whose body identifies the IdP single-active-grant session-supersession
+/// class names it in the terminal detail — the operator sees WHY the
+/// just-minted token died (superseded by a later exchange) and that the
+/// token lifecycle is not at fault. Terminal classification unchanged.
+#[tokio::test]
+async fn fresh_token_rejected_superseded_body_names_the_class() {
+    let superseded_body = r#"{"error":"invalid_grant","error_description":"removing orphaned oauth2 session"}"#.to_string();
+    let idp = spawn_mock_idp(vec![
+        (400, INVALID_TOKEN_400.to_string()),
+        (400, superseded_body.clone()),
+    ])
+    .await;
+    let provider = svc_provider(&idp);
+    let rs = ResourceServerClient::new();
+
+    let mut claims = user_claims(&rs, &idp).await;
+    let err = rs
+        .enrich_claims_with_userinfo_own_token(&provider, &mut claims, &idp.iss, None)
+        .await
+        .expect_err("fail-closed contract unchanged: second-leg 400 still terminal");
+
+    assert!(err.is_auth_degraded(), "same AuthDegraded variant: {err}");
+    assert!(!err.retryable(), "classification unchanged: terminal, never retry-burn");
+    let detail = format!("{err}");
+    assert!(
+        detail.contains("JUST-MINTED"),
+        "still self-describes as the upstream-window class: {detail}"
+    );
+    assert!(
+        detail.contains("invalid_grant"),
+        "upstream body still carried: {detail}"
+    );
+    assert!(
+        detail.contains("superseded by a later"),
+        "supersession class must be NAMED when the body identifies it: {detail}"
+    );
+    assert!(
+        detail.contains("token lifecycle not at fault"),
+        "attribution must clear the token lifecycle: {detail}"
+    );
+    assert!(claims.extra.get("groups").is_none());
+    assert_eq!(idp.exchange_count(), 2);
+    assert_eq!(idp.userinfo_count(), 2);
+}
+
 // ---------------------------------------------------------------------------
 // Pin 3: foreign-token path is byte-identical (no re-mint, terminal on 400)
 // ---------------------------------------------------------------------------

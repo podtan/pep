@@ -29,6 +29,10 @@ enum UserinfoMode {
     Ok200,
     /// 400 invalid_token — the exact mid-flight token blip from the incidents.
     Status400,
+    /// 400 invalid_grant + session-supersession vocabulary — the IdP
+    /// single-active-grant class (595f826d fix lane): the token is likely
+    /// VALID, superseded by a later exchange.
+    Status400Superseded,
     /// 503 — IdP briefly unavailable.
     Status503,
 }
@@ -83,6 +87,10 @@ async fn spawn_mock_idp(initial: UserinfoMode) -> MockIdp {
                         UserinfoMode::Status400 => {
                             ("400 Bad Request", r#"{"error":"invalid_token"}"#.to_string())
                         }
+                        UserinfoMode::Status400Superseded => (
+                            "400 Bad Request",
+                            r#"{"error":"invalid_grant","error_description":"oauth2 session superseded by a later exchange"}"#.to_string(),
+                        ),
                         UserinfoMode::Status503 => {
                             ("503 Service Unavailable", r#"{"error":"temporarily_unavailable"}"#.to_string())
                         }
@@ -174,6 +182,52 @@ async fn userinfo_400_invalid_token_is_auth_degraded_non_retryable() {
     assert!(!err.retryable(), "400 invalid_token is terminal → deny, not 503");
     // And the lie is structurally impossible: claims never gain silent emptiness.
     assert!(claims.extra.get("groups").is_none());
+    // 0.5.14 attribution-only enrichment: the body is carried, but the
+    // GENERIC invalid_token body must NOT name the supersession class —
+    // mis-attribution on ordinary dead bearers would be a new lying class.
+    let detail = format!("{err}");
+    assert!(
+        detail.contains("invalid_token"),
+        "upstream body must be carried into the detail: {detail}"
+    );
+    assert!(
+        !detail.contains("superseded by a later"),
+        "generic invalid_token must NOT carry the supersession attribution: {detail}"
+    );
+}
+
+/// The 595f826d fix lane (CPO ruling 2026-10-27, leg 4): a 400 body that
+/// identifies the IdP single-active-grant session-supersession class
+/// (invalid_grant + "session superseded by a later exchange") gets the
+/// attribution NAMED in the terminal detail — token likely VALID, re-mint
+/// heals, lifecycle not at fault. Classification unchanged: still terminal.
+#[tokio::test]
+async fn userinfo_400_superseded_session_names_the_class() {
+    let idp = spawn_mock_idp(UserinfoMode::Status400Superseded).await;
+    let rs = ResourceServerClient::new();
+    let token = sign_token(&idp.iss);
+
+    let mut claims = validated_claims(&rs, &idp, &token).await;
+    let err = rs
+        .enrich_claims_with_userinfo(&mut claims, &token, &idp.iss, None)
+        .await
+        .expect_err("fail-closed contract unchanged: superseded-session 400 still denies");
+    assert!(err.is_auth_degraded(), "same AuthDegraded variant: {err}");
+    assert!(!err.retryable(), "classification unchanged: terminal → deny");
+    assert!(claims.extra.get("groups").is_none(), "claims never gain silent emptiness");
+    let detail = format!("{err}");
+    assert!(
+        detail.contains("invalid_grant"),
+        "upstream body must be carried into the detail: {detail}"
+    );
+    assert!(
+        detail.contains("superseded by a later"),
+        "supersession class must be NAMED when the body identifies it: {detail}"
+    );
+    assert!(
+        detail.contains("re-mint heals"),
+        "attribution must state the heal path: {detail}"
+    );
 }
 
 /// IdP briefly down (503): degraded AND retryable — maps to 503-class, not deny.

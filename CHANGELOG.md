@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.5.14 — 2026-10-27
+
+**Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump).
+No public type, trait, or function signature changes: attribution-only detail
+enrichment inside the existing `PepError::AuthDegraded` payloads — the 0.5.13
+rotation-window naming precedent, applied to the userinfo rejection class.
+
+Attribution enrichment for the IdP session-supersession class (CPO ruling
+2026-10-27, 595f826d fix lane, leg 4 — "attribution-only, zero behavior
+change"):
+
+- Foreign-token path (`enrich_claims_with_userinfo`; the 0.5.8 fail-closed
+  contract stays BYTE-FROZEN — classification unchanged): a 4xx AuthDegraded
+  detail now carries the upstream rejection body (truncated to 200 chars,
+  the same rule as the 0.5.10 own-token path) so the specimen self-describes.
+- When a 400/401 body identifies the IdP single-active-grant
+  session-supersession class, the terminal detail NAMES it:
+  "token likely VALID: superseded by a later IdP exchange
+  (single-active-grant session semantics); re-mint heals; token lifecycle
+  not at fault". Applied on both terminal surfaces: the foreign-token 400
+  detail and the own-token second-leg (JUST-MINTED rejected after re-mint)
+  detail.
+- Attribution gate: the body must carry grant/session-invalidation
+  vocabulary (`invalid_grant` / `invalid_session`, or `session` plus one of
+  `orphaned` / `superseded` / `removed` / `revoked`) — never the generic
+  `invalid_token`, which is the ordinary dead-bearer signal; firing on it
+  would be a new lying class. The exact upstream rendering is ruling leg
+  (b) (kanidm source investigation, paydar's lane); this marker set is the
+  tunable contract point, refinable by patch with zero API impact.
+- Classification unchanged everywhere: 4xx terminal `retryable: false`,
+  5xx/429 `retryable: true`, budget-of-one re-mint, single-flight mint —
+  exactly as shipped through 0.5.13. No consumer-visible behavior change;
+  `detail` strings only.
+
 ## 0.5.13 — 2026-10-26
 
 **Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump).
