@@ -179,7 +179,9 @@ pub struct ServiceAccountConfig {
 /// short-lived OIDC access tokens via RFC 8693 token exchange.
 ///
 /// Caches the resulting access token in memory and proactively refreshes
-/// it 30 seconds before expiry.
+/// it at the buffered expiry minus the proactive horizon, with a
+/// per-instance jitter so a fleet of seats does not mint in phase (see
+/// [`Self::PROACTIVE_REFRESH_SECS`] and [`Self::REFRESH_JITTER_SECS`]).
 #[derive(Clone)]
 pub struct ServiceAccountTokenProvider {
     oidc_client: OidcClient,
@@ -191,6 +193,10 @@ pub struct ServiceAccountTokenProvider {
     /// 401 storm collapses into exactly ONE IdP exchange and a reactive
     /// re-mint can no longer double-mint against the proactive refresher.
     mint_gate: Arc<Mutex<()>>,
+    /// Per-instance jitter offset in `[0, REFRESH_JITTER_SECS]` added to
+    /// the refresh horizon (fleet herd desync; see
+    /// [`Self::REFRESH_JITTER_SECS`]).
+    refresh_jitter_secs: u64,
 }
 
 impl std::fmt::Debug for ServiceAccountTokenProvider {
@@ -216,6 +222,18 @@ impl ServiceAccountTokenProvider {
     /// 374803e5).
     pub const PROACTIVE_REFRESH_SECS: u64 = 90;
 
+    /// Fleet jitter applied ON TOP of [`Self::PROACTIVE_REFRESH_SECS`]:
+    /// each provider instance draws a FIXED offset in
+    /// `[0, REFRESH_JITTER_SECS]` at construction (from process-start
+    /// nanos — no `rand` dependency) and its refresh horizon becomes
+    /// `PROACTIVE_REFRESH_SECS + offset`. This desynchronizes mint phases
+    /// across a fleet of seats (herd avoidance: N seats must not hit the
+    /// IdP in the same second) while never weakening the correctness
+    /// floor — the offset can only move the horizon EARLIER, so the
+    /// real-life mint margin only grows (nghr fb82b866 spec c35042bb,
+    /// leg L1: "jitter ±15s fleet-wide to avoid herd").
+    pub const REFRESH_JITTER_SECS: u64 = 15;
+
     /// Create a new service account token provider.
     pub fn new(config: ServiceAccountConfig) -> Self {
         Self {
@@ -223,6 +241,7 @@ impl ServiceAccountTokenProvider {
             config,
             cache: Arc::new(RwLock::new(None)),
             mint_gate: Arc::new(Mutex::new(())),
+            refresh_jitter_secs: Self::draw_jitter(),
         }
     }
 
@@ -234,7 +253,28 @@ impl ServiceAccountTokenProvider {
             config,
             cache: Arc::new(RwLock::new(None)),
             mint_gate: Arc::new(Mutex::new(())),
+            refresh_jitter_secs: Self::draw_jitter(),
         }
+    }
+
+    /// Draw this instance's jitter offset: sub-second nanos at construction,
+    /// bucketed into `[0, REFRESH_JITTER_SECS]`. Per-instance, not secret;
+    /// process start times differ across the fleet, so phases diverge.
+    fn draw_jitter() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64 % (Self::REFRESH_JITTER_SECS + 1))
+            .unwrap_or(0)
+    }
+
+    /// THIS instance's refresh horizon on the buffer-adjusted clock: the
+    /// fixed serve floor widened by the per-instance jitter. Used
+    /// consistently by the background refresher's wake-up, the
+    /// single-flight cache re-check, and the serve threshold — an early
+    /// (jittered) background wake must not be refused by the gate's
+    /// re-check, or the jitter would no-op.
+    fn refresh_horizon(&self) -> u64 {
+        Self::PROACTIVE_REFRESH_SECS + self.refresh_jitter_secs
     }
 
     /// Force a token exchange regardless of cache state.
@@ -302,7 +342,7 @@ impl ServiceAccountTokenProvider {
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.as_ref() {
-                if cached.seconds_remaining() > Self::PROACTIVE_REFRESH_SECS {
+                if cached.seconds_remaining() > self.refresh_horizon() {
                     tracing::debug!(
                         audience = %self.config.audience,
                         "pep: mint gate acquired after a concurrent refresh; serving the fresh cache"
@@ -331,10 +371,11 @@ impl ServiceAccountTokenProvider {
     }
 
     /// Spawn a background task that keeps the cache fresh proactively: it
-    /// exchanges at the T-90s horizon (`PROACTIVE_REFRESH_SECS`) WITHOUT
-    /// waiting for a caller, so long-idle processes (payam sends during
-    /// quiet periods — nghr 374803e5) never start an operation on a dying
-    /// token.
+    /// exchanges at THIS instance's refresh horizon
+    /// (`PROACTIVE_REFRESH_SECS + per-instance jitter`, herd desync across
+    /// the fleet — fb82b866 spec c35042bb L1) WITHOUT waiting for a
+    /// caller, so long-idle processes (payam sends during quiet periods —
+    /// nghr 374803e5) never start an operation on a dying token.
     ///
     /// Failure posture: an exchange failure is logged (warn) and retried
     /// after a 5s backoff — the cache keeps its previous token, and
@@ -355,7 +396,7 @@ impl ServiceAccountTokenProvider {
                     let cache = this.cache.read().await;
                     match cache.as_ref() {
                         Some(t) => Duration::from_secs(
-                            t.seconds_remaining().saturating_sub(Self::PROACTIVE_REFRESH_SECS),
+                            t.seconds_remaining().saturating_sub(this.refresh_horizon()),
                         ),
                         None => Duration::ZERO,
                     }
@@ -378,14 +419,16 @@ impl ServiceAccountTokenProvider {
 
 impl TokenProvider for ServiceAccountTokenProvider {
     async fn get_token(&self) -> Result<String> {
-        // Fast path: serve the cached token ONLY if it outlives the T-90s
-        // proactive-refresh horizon. A token this close to death can expire
-        // mid-request — the exact payam 374803e5 incident wire — so it is
-        // exchanged instead of served.
+        // Fast path: serve the cached token ONLY if it outlives THIS
+        // instance's refresh horizon (fixed floor + per-instance jitter).
+        // A token this close to death can expire mid-request — the exact
+        // payam 374803e5 incident wire — so it is exchanged instead of
+        // served. The jitter only widens the margin (horizon moves
+        // earlier), never shrinks it.
         {
             let cache = self.cache.read().await;
             if let Some(cached) = cache.as_ref() {
-                if cached.seconds_remaining() > Self::PROACTIVE_REFRESH_SECS {
+                if cached.seconds_remaining() > self.refresh_horizon() {
                     return Ok(cached.token.clone());
                 }
             }
@@ -1215,5 +1258,82 @@ mod tests {
             _ => unreachable!(),
         };
         assert!(cache.read().await.is_none());
+    }
+
+    // -- fleet jitter horizon (nghr fb82b866 spec c35042bb L1; 0.5.15) -------
+
+    fn svc_provider_with_jitter(jitter: u64) -> ServiceAccountTokenProvider {
+        let mut p = ServiceAccountTokenProvider::new(ServiceAccountConfig {
+            service_token: "svc".to_string(),
+            issuer_url: "https://idm.example".to_string(),
+            client_id: "pdt-api".to_string(),
+            client_secret: None,
+            audience: "pdt-api".to_string(),
+            scope: None,
+        });
+        p.refresh_jitter_secs = jitter; // same-module: private field is settable
+        p
+    }
+
+    #[test]
+    fn drawn_jitter_offsets_stay_within_bounds() {
+        for _ in 0..32 {
+            let p = ServiceAccountTokenProvider::new(ServiceAccountConfig {
+                service_token: "svc".to_string(),
+                issuer_url: "https://idm.example".to_string(),
+                client_id: "pdt-api".to_string(),
+                client_secret: None,
+                audience: "pdt-api".to_string(),
+                scope: None,
+            });
+            assert!(
+                p.refresh_jitter_secs <= ServiceAccountTokenProvider::REFRESH_JITTER_SECS,
+                "jitter {} out of [0, {}]",
+                p.refresh_jitter_secs,
+                ServiceAccountTokenProvider::REFRESH_JITTER_SECS
+            );
+        }
+    }
+
+    #[test]
+    fn refresh_horizon_is_fixed_floor_plus_jitter() {
+        assert_eq!(
+            svc_provider_with_jitter(0).refresh_horizon(),
+            ServiceAccountTokenProvider::PROACTIVE_REFRESH_SECS
+        );
+        assert_eq!(
+            svc_provider_with_jitter(15).refresh_horizon(),
+            ServiceAccountTokenProvider::PROACTIVE_REFRESH_SECS
+                + ServiceAccountTokenProvider::REFRESH_JITTER_SECS
+        );
+    }
+
+    #[tokio::test]
+    async fn jittered_horizon_gates_the_serve_path_without_weakening_the_floor() {
+        // remaining 100s on the buffer-adjusted clock:
+        // jitter 15 → horizon 105 → 100 is BELOW the horizon → NOT served;
+        // the slow path runs and fails LOUD against the unreachable issuer
+        // (fail-closed, never a lying serve).
+        let p15 = svc_provider_with_jitter(15);
+        *p15.cache.write().await = Some(CachedToken {
+            token: "jittered".to_string(),
+            expires_at: UNIX_EPOCH + Duration::from_secs(now_epoch() + 100),
+        });
+        assert!(
+            p15.get_token().await.is_err(),
+            "below the jittered horizon: must re-exchange (fail loud), not serve"
+        );
+
+        // jitter 0 → horizon 90 → 100 is above the floor → served from cache.
+        let p0 = svc_provider_with_jitter(0);
+        *p0.cache.write().await = Some(CachedToken {
+            token: "cached".to_string(),
+            expires_at: UNIX_EPOCH + Duration::from_secs(now_epoch() + 100),
+        });
+        assert_eq!(
+            p0.get_token().await.unwrap(),
+            "cached",
+            "above the fixed floor: served from cache without an exchange"
+        );
     }
 }

@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.5.15 — 2026-10-28
+
+**Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump).
+No public type, trait, or function signature changes; one additive public
+constant (`REFRESH_JITTER_SECS`). Tuning behind the existing
+`ServiceAccountTokenProvider` — the 0.5.12 additive-behind-optional-feature
+precedent is stricter than what this needs.
+
+- **Fleet refresh jitter (±15s)** on the `ServiceAccountTokenProvider`
+  proactive-refresh horizon (nghr fb82b866, spec response c35042bb, leg L1
+  "re-exchange before expiry … jitter ±15s fleet-wide to avoid herd"): each
+  provider instance draws a FIXED offset in `[0, 15]` seconds at construction
+  (process-start nanos — no `rand` dependency) and applies it consistently to
+  the background refresher's wake-up, the single-flight cache re-check, and
+  the serve threshold. The offset can only move the horizon EARLIER: the
+  per-seat real-life mint margin grows from `exp − 210s` (120s buffer + 90s
+  horizon) to `exp − 210…225s`, so the correctness floor — never serve a
+  token that can die mid-request (payam 374803e5 wire) — is never weakened,
+  while fleet mint phases stop overlapping. The spec's "re-exchange at
+  T-120s" ask was ALREADY exceeded by the in-tree buffered horizon (effective
+  `exp − 210s` since 0.5.9/0.5.11); nothing was relaxed, the genuine gap was
+  the herd desync alone.
+- Verified unchanged (spec leg L2, "mostly shipped, finish it"): the
+  refresh-leg 400-on-expired path re-mints with fresh-token validation and a
+  single retry — existing wire coverage
+  (`rejected_own_token_remints_validates_and_succeeds`, plus the terminal and
+  supersession pins). Real-exp parsing (849e7528) and the single-flight mint
+  gate (0.5.11) untouched. `AuthDegraded` fail-closed classification
+  unchanged everywhere (CPO ruling 595f826d posture). The fixed-floor
+  clock-skew warning ("fresh token born at/below the serve threshold") still
+  keys on the unjittered floor — jitter must not mask the skew signature.
+- Doc fix: the struct-level "proactively refreshes it 30 seconds before
+  expiry" claim was stale (pre-0.5.9); it now states the buffered horizon +
+  jitter posture.
+
 ## 0.5.14 — 2026-10-27
 
 **Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump).
