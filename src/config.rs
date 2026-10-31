@@ -106,6 +106,15 @@ pub struct OidcConfig {
     /// Expected audience value (if different from client_id)
     #[serde(default)]
     pub expected_audience: Option<String>,
+
+    /// Additional trusted issuer URLs for per-token issuer fallback (0.5.16,
+    /// issue 895cbcea — CPO IdP cut-over re-arm condition). A token that
+    /// FAILS validation against `issuer_url` is retried ONCE against its own
+    /// `iss` claim — but only if `iss` is listed here. Absent/empty (the
+    /// default) = strict single-issuer validation, unchanged behavior.
+    /// Apply via `ResourceServerClient::new().with_trusted_issuers(cfg.trusted_issuers())`.
+    #[serde(default)]
+    pub trusted_issuers: Option<Vec<String>>,
 }
 
 impl OidcConfig {
@@ -135,6 +144,13 @@ impl OidcConfig {
             client_id: self.client_id.clone(),
             validation_options,
         }
+    }
+
+    /// Trusted-issuer allowlist for the resource server (empty = strict
+    /// single-issuer). See `ResourceServerClient::with_trusted_issuers`
+    /// (0.5.16, issue 895cbcea).
+    pub fn trusted_issuers(&self) -> Vec<String> {
+        self.trusted_issuers.clone().unwrap_or_default()
     }
 }
 
@@ -288,6 +304,7 @@ local_dev_email = "dev@example.com"
             skip_issuer_validation: None,
             skip_audience_validation: None,
             expected_audience: None,
+            trusted_issuers: None,
         };
 
         let client_config = oidc_config.to_oidc_client_config();

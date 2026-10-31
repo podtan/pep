@@ -149,6 +149,29 @@ pub fn jwk_algorithm_to_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Result<Algori
     }
 }
 
+/// Extract the `iss` claim from a JWT WITHOUT validating its signature.
+///
+/// The claim is used ONLY to select a candidate issuer from the operator's
+/// trusted-issuer allowlist; signature trust is established afterwards by
+/// full validation against that issuer's own discovery + JWKS. Returns `None`
+/// when the token is not a well-formed three-segment JWT or the payload
+/// carries no string `iss` (the caller then keeps the primary error).
+fn extract_iss_claim(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload_b64 = token.split('.').nth(1)?;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    claims.get("iss")?.as_str().map(|s| s.to_string())
+}
+
+/// Issuer equality with trailing-slash normalization
+/// (`https://idp.example/` == `https://idp.example`).
+fn issuer_matches(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
 /// Resource server client for JWT validation
 #[derive(Clone)]
 pub struct ResourceServerClient {
@@ -171,6 +194,10 @@ pub struct ResourceServerClient {
     pub bypass_gate: Arc<tokio::sync::Mutex<()>>,
     /// Last paced-bypass attempt per jwks_uri (0.5.13).
     pub last_bypass: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Trusted-issuer allowlist for per-token issuer fallback (0.5.16).
+    /// Empty (default) = strict single-issuer validation, byte-identical to
+    /// pre-0.5.16 behavior. See [`ResourceServerClient::with_trusted_issuers`].
+    pub trusted_issuers: Vec<String>,
 }
 
 impl ResourceServerClient {
@@ -186,7 +213,34 @@ impl ResourceServerClient {
             forced_fetch_hold: Arc::new(RwLock::new(HashMap::new())),
             bypass_gate: Arc::new(tokio::sync::Mutex::new(())),
             last_bypass: Arc::new(RwLock::new(HashMap::new())),
+            trusted_issuers: Vec::new(),
         }
+    }
+
+    /// Configure the trusted-issuer allowlist for per-token issuer fallback
+    /// (0.5.16, issue 895cbcea — CPO IdP cut-over re-arm condition 1).
+    ///
+    /// With an EMPTY allowlist (the default) validation is strict
+    /// single-issuer and byte-identical to pre-0.5.16 behavior. With a
+    /// non-empty allowlist, a token that FAILS validation against the
+    /// configured issuer is retried ONCE against the issuer named by its own
+    /// `iss` claim — but only if that issuer is on this allowlist. The retry
+    /// runs FULL validation (signature via that issuer's discovery + JWKS
+    /// through the existing per-issuer caches, exp, audience) and is accepted
+    /// only if it fully succeeds; any fallback failure returns the ORIGINAL
+    /// configured-issuer error (fail-closed preserved).
+    ///
+    /// Security posture: an attacker-controlled `iss` can only select among
+    /// issuer URLs the operator explicitly allowlisted, and keys are fetched
+    /// from that issuer's own discovery document — no new trust boundary.
+    /// Trailing slashes are normalized for allowlist matching.
+    pub fn with_trusted_issuers(mut self, trusted: Vec<String>) -> Self {
+        self.trusted_issuers = trusted
+            .into_iter()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self
     }
 
     /// Fetch OIDC discovery document with caching
@@ -402,8 +456,13 @@ impl ResourceServerClient {
         }
     }
 
-    /// Validate JWT token with custom validation options
-    pub async fn validate_jwt_with_options(
+    /// Validate a token against EXACTLY ONE issuer — the one passed in.
+    ///
+    /// This is the pre-0.5.16 behavior, byte-for-byte: discovery + JWKS come
+    /// strictly from `issuer_url`, and `iss` is enforced against it. Internal;
+    /// the public [`Self::validate_jwt_with_options`] wraps this with the
+    /// optional trusted-issuer fallback (0.5.16, issue 895cbcea).
+    async fn validate_jwt_single_issuer(
         &self,
         token: &str,
         issuer_url: &str,
@@ -566,6 +625,73 @@ impl ResourceServerClient {
             .map_err(|e| PepError::JwtValidation(format!("JWT validation failed: {}", e)))?;
 
         Ok(token_data.claims)
+    }
+
+    /// Validate a JWT with custom validation options, optionally falling back
+    /// to the token's own (allowlisted) issuer — 0.5.16 per-token issuer
+    /// fallback (issue 895cbcea; CPO ruling 2026-10-31, option (a)).
+    ///
+    /// Order of operations:
+    /// 1. Validate against the CONFIGURED issuer exactly as always
+    ///    ([`Self::validate_jwt_single_issuer`]). Success ⇒ returned as-is.
+    /// 2. On failure AND a non-empty trusted-issuer allowlist: parse the
+    ///    token's `iss` claim (payload inspected without signature trust —
+    ///    the claim only SELECTS a candidate issuer). If `iss` is the
+    ///    configured issuer or is not on the allowlist, the original error
+    ///    is returned.
+    /// 3. Otherwise retry ONCE against `iss` itself: its discovery document,
+    ///    its JWKS (through the same per-issuer caches), same audience
+    ///    policy, `iss` enforced to the token's own issuer. Full validation
+    ///    must succeed; any fallback failure returns the ORIGINAL error.
+    pub async fn validate_jwt_with_options(
+        &self,
+        token: &str,
+        issuer_url: &str,
+        client_id: &str,
+        options: &JwtValidationOptions,
+    ) -> Result<JwtClaims> {
+        if self.trusted_issuers.is_empty() {
+            // Default posture: strict single-issuer, zero extra work.
+            return self
+                .validate_jwt_single_issuer(token, issuer_url, client_id, options)
+                .await;
+        }
+
+        match self
+            .validate_jwt_single_issuer(token, issuer_url, client_id, options)
+            .await
+        {
+            Ok(claims) => Ok(claims),
+            Err(primary) => {
+                let token_iss = match extract_iss_claim(token) {
+                    Some(iss) => iss,
+                    None => return Err(primary),
+                };
+                let allowlisted = self
+                    .trusted_issuers
+                    .iter()
+                    .any(|trusted| issuer_matches(trusted, &token_iss));
+                if !allowlisted || issuer_matches(&token_iss, issuer_url) {
+                    return Err(primary);
+                }
+                tracing::info!(
+                    configured = %issuer_url,
+                    token_iss = %token_iss,
+                    "pep: configured-issuer validation failed — attempting allowlisted \
+                     per-token issuer fallback (895cbcea)"
+                );
+                match self
+                    .validate_jwt_single_issuer(token, &token_iss, client_id, options)
+                    .await
+                {
+                    Ok(claims) => Ok(claims),
+                    // Fail-closed: the fallback never widens an error into a
+                    // pass, and the caller keeps seeing the configured-issuer
+                    // failure that triggered it.
+                    Err(_) => Err(primary),
+                }
+            }
+        }
     }
 
     /// Validate JWT token with default options

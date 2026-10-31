@@ -58,7 +58,7 @@ pep = { version = "0.5", features = ["oidc", "axum", "config", "rfc9728"] }
 behavioral hardening ship as patch releases (0.5.x) and pinned consumers adopt
 them with a plain `cargo update` — no code changes, no coordinated cutover.
 Additive API surface has been ruled patch-class when it does not break existing
-call sites (see CHANGELOG rulings for 0.5.8 through 0.5.14). `PepError` is
+call sites (see CHANGELOG rulings for 0.5.8 through 0.5.16). `PepError` is
 `#[non_exhaustive]`: never exhaustive-match on it. Breaking changes, if ever
 needed, bump the minor line (0.6) — never inside 0.5.x.
 
@@ -98,6 +98,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+#### Per-token issuer fallback (optional, 0.5.16)
+
+For IdP cut-overs, allow the OLD issuer's tokens to keep validating against a
+client configured for the NEW issuer. Default (no allowlist) = strict
+single-issuer, unchanged:
+
+```rust
+let client = pep::oidc_resource_server::ResourceServerClient::new()
+    .with_trusted_issuers(vec!["https://idp.tanbal.ir".to_string()]);
+// TOML equivalent: [oidc] trusted_issuers = ["https://idp.tanbal.ir"]
+//   applied via ResourceServerClient::new().with_trusted_issuers(cfg.trusted_issuers())
+```
+
+A token failing against the configured issuer is retried ONCE against its own
+`iss` — only if allowlisted; full validation must succeed, else the original
+error is returned (fail-closed).
 
 ### OIDC Client (Web Authentication Flow)
 

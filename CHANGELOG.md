@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.5.16 — 2026-10-31
+
+**Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by
+bump). Strictly additive: one new optional field on `OidcConfig`
+(`trusted_issuers`), one builder method + one field on `ResourceServerClient`,
+one new internal helper — the `validate_jwt_with_options` signature is
+UNCHANGED and, with the allowlist empty (the default; every existing
+consumer's shape today), validation is byte-identical to 0.5.15. The 0.5.12
+additive-behind-optional-feature precedent applies; `PepError` untouched.
+
+- **Per-token issuer fallback / trusted-issuers allowlist** (nghr 895cbcea —
+  CPO ruling 2026-10-31 option (a), IdP cut-over re-arm condition 1): a
+  token that FAILS validation against the configured issuer is retried ONCE
+  against the issuer named by its own `iss` claim — but only when that
+  issuer is on the operator's allowlist
+  (`ResourceServerClient::new().with_trusted_issuers(...)`, TOML key
+  `[oidc] trusted_issuers`). The retry runs FULL validation — signature via
+  the token issuer's own discovery + JWKS through the existing per-issuer
+  caches, expiry, audience — and is accepted only on full success; any
+  fallback failure returns the ORIGINAL configured-issuer error (fail-closed
+  preserved). Rationale: the IdP cut-over (petit pdt AUTH_ISSUER_URL →
+  idm.podai.ir) would otherwise 401 every old-issuer token twice over (iss
+  mismatch AND kid miss) and darken the platform store's authz plane for the
+  whole Tanbal leaf (thq reconciler writes, fame/payam/nghr service
+  exchanges, agent calls).
+- Tests: 5 new wire tests (`tests/trusted_issuers.rs`, mock-IdP pattern, two
+  issuers/two keypairs): default-reject both failure classes, allowlisted
+  fallback validates, non-allowlisted stays rejected, configured-issuer
+  primary path unaffected, fallback failure preserves the primary error.
+  Suite: 215 green (168 unit + 4 jwks_rotation + 7 own_token_enrichment +
+  8 pdt_roles + 12 token_hardening + 5 trusted_issuers + 6
+  userinfo_degraded + 5 doc).
+
 ## 0.5.15 — 2026-10-28
 
 **Ruling: patch-class** (pin `pep = "0.5"` unchanged; consumers adopt by bump).
